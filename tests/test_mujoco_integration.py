@@ -88,6 +88,15 @@ class MuJoCoMemoryIntegrationTest(unittest.TestCase):
                 self.assertEqual(latest_knowledge.fact.value,
                                  {"x": last_pose[0], "y": last_pose[1], "z": last_pose[2]})
 
+                retrieved = memory.retrieve_async(
+                    valid_at=last_time, entity_id="ant/base",
+                    predicates=("pose_xyz_m",),
+                ).result(timeout=3)
+                self.assertEqual(retrieved.states[0][2].fact.event_id, last_event)
+                self.assertTrue(retrieved.context()["states"][0]["usable"])
+                self.assertEqual(retrieved.evidence[0].source,
+                                 "mujoco:Ant-v5/qpos")
+
                 cached = memory.read_state(
                     subject="ant/base", predicate="pose_xyz_m", now=last_time,
                 )

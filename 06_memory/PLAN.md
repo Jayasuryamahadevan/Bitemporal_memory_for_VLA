@@ -9,6 +9,56 @@ ROS 2 package, so this work builds a usable, ROS-agnostic runtime boundary;
 it does not pretend to solve perception or provide hard real-time guarantees
 from Python.
 
+## Research translated into interfaces
+
+| Primary work | Interface adopted here | Still outside this repository |
+|---|---|---|
+| [OpenEQA (CVPR 2024)](https://openaccess.thecvf.com/content/CVPR2024/html/Majumdar_OpenEQA_Embodied_Question_Answering_in_the_Era_of_Foundation_Models_CVPR_2024_paper.html) | Episodic lookup at an explicit world and knowledge time, with source records | OpenEQA benchmark ingestion and answer scoring |
+| [Embodied-RAG (2024)](https://arxiv.org/abs/2409.18313) | Bounded retrieval across entities, observations and relations | Learned hierarchical summaries and multimodal embeddings |
+| [GraphEQA (CoRL 2025)](https://proceedings.mlr.press/v305/saxena25a.html) | Directed, evidence-backed scene relations; bounded subgraph traversal | Online metric-semantic graph construction and image reasoning |
+| [Mind Palace (CoRL 2025)](https://proceedings.mlr.press/v305/ginting25a.html) | Explicit unresolved results for a planner to request further observation | Navigation and value-of-information exploration policy |
+| [MemoryEQA (2025)](https://arxiv.org/abs/2505.13948) | Shared retrieval result for question answering, planning and VLA context | Learned module-specific retrieval policies |
+
+These works guide interfaces; this implementation does not claim their model
+accuracy or reproduce their benchmark results.
+
+The robot-facing data path is:
+
+```mermaid
+flowchart LR
+  P[RGB-D, audio, pose, sensors] --> A[Observation adapter / tracker]
+  A --> E[(Append-only bitemporal ledger)]
+  E --> O[Episodic observations]
+  E --> G[Scene relation facts]
+  E --> F[Semantic state facts]
+  O --> R[Bounded evidence retrieval]
+  G --> R
+  F --> R
+  R --> Q[Question answering and planner]
+  R --> V[VLA context]
+  F --> H[Immutable hot snapshot]
+  H --> C[Control path]
+```
+
+The observation adapter is a contract for upstream perception: timestamp,
+robot and episode identity, stable entity ID, source, optional frame and
+position, and a URI into durable media. There is no RGB-D or audio decoder in
+this repository. Relations are directed fact keys of the form
+`relation:<name>:<target>` with a source entity as subject. Each assertion
+references a stored observation. A changed relation must be retracted or have
+an explicit validity end; otherwise both edges remain as distinct evidence.
+
+`MemoryRetriever` pins one event cursor per request and retrieves a bounded
+subgraph, state facts and observations. Its context includes status,
+confidence, event IDs, evidence URIs and a `usable` flag. Only a verified,
+unexpired assertion that passes the caller's optional freshness limit is
+usable. Dynamic predicates require an explicit freshness limit. This retrieval
+is off the control path.
+The query API uses structured filters and full-text terms; it does not expose
+arbitrary SQL or claim natural-language reasoning. A language model can
+translate questions into these filters and cite the returned evidence, but
+its answers must be evaluated separately.
+
 ## Runtime paths
 
 ### 1. Control path: bounded RAM read
@@ -113,12 +163,14 @@ event schema before it combines data across clock resets or replay domains.
 2. **Implemented:** immutable hot snapshots, bounded ingestion with reserved
    capacity, asynchronous bitemporal queries, startup hydration, and counters.
 3. **Implemented:** retain the append-only bitemporal ledger as source of truth.
-4. **Next:** integrate a real ROS 2 recorder, timestamped TF transforms, stable
+4. **Implemented:** bounded evidence-grounded retrieval over episodic records,
+   state facts and directed scene relations, with one knowledge cursor.
+5. **Next:** integrate a real ROS 2 recorder, timestamped TF transforms, stable
    object tracker, and hardware identity; this repository currently has none.
-5. **Hardware gate:** measure snapshot read p50/p99/max; write acceptance and
+6. **Hardware gate:** measure snapshot read p50/p99/max; write acceptance and
    commit delay; queue high-water/rejection counts; reboot and full-disk
    recovery; stale-state errors; retrieval precision; task success.
-6. **Evaluation gate:** compare memory enabled, disabled, and conflicting/donor
+7. **Evaluation gate:** compare memory enabled, disabled, and conflicting/donor
    memory using the same task seed and current observation.
 
 No throughput or task-success claim is made until those robot-side measurements

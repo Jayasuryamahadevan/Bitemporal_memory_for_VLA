@@ -22,6 +22,7 @@ import threading
 import time
 
 from .store import Fact, MemoryStore, StateAnswer
+from .retrieval import MemoryRetriever, RetrievalResult, relation_predicate
 
 
 UTC = timezone.utc
@@ -169,6 +170,7 @@ class OnboardMemory:
             raise ValueError("robot_id must be a nonempty string")
         self.robot_id = robot_id.strip()
         self._store = MemoryStore(path)
+        self._retriever = MemoryRetriever(self._store, robot_id=self.robot_id)
         self._write_queue: queue.Queue[_WriteJob] = queue.Queue(write_queue_capacity)
         self._reserved_critical_slots = reserved_critical_slots
         self._max_hot_keys = max_hot_keys
@@ -281,6 +283,15 @@ class OnboardMemory:
         """Queue an evidence-backed assertion; receipt yields its event ID."""
         return self._submit_write("fact", self._robot_kwargs(kwargs), critical=True)
 
+    def submit_relation(self, *, source_entity_id: str, relation: str,
+                        target_entity_id: str, **kwargs: Any) -> WriteReceipt:
+        """Queue an evidence-backed directed scene-graph edge."""
+        return self.submit_fact(
+            subject=source_entity_id,
+            predicate=relation_predicate(relation, target_entity_id),
+            value=target_entity_id.strip(), **kwargs,
+        )
+
     def submit_retraction(self, **kwargs: Any) -> WriteReceipt:
         return self._submit_write("retraction", self._robot_kwargs(kwargs), critical=True)
 
@@ -292,6 +303,10 @@ class OnboardMemory:
 
     def history_async(self, **kwargs: Any) -> Future[list[dict[str, Any]]]:
         return self._submit_query(self._store.history, self._robot_kwargs(kwargs))
+
+    def retrieve_async(self, **kwargs: Any) -> Future[RetrievalResult]:
+        """Run bounded multi-layer retrieval outside the control callback."""
+        return self._submit_query(self._retriever.retrieve, kwargs)
 
     def _submit_query(self, operation, kwargs):
         with self._submit_lock:

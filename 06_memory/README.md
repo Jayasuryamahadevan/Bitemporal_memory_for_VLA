@@ -133,6 +133,52 @@ unconstrained language-model answer. A slower planner may translate a natural
 language request into these structured queries, then cite the returned
 evidence.
 
+## Evidence-grounded graph retrieval
+
+The same observation can support a semantic assertion or a directed scene
+relation. The upstream tracker supplies stable IDs and frame-correct geometry.
+The memory stores a relation as a separate evidence-backed fact, so it can be
+queried at both world time and knowledge time, corrected, or retracted.
+
+```python
+from datetime import datetime, timedelta, timezone
+from robomemory import MemoryStore, MemoryRetriever
+
+store = MemoryStore("robot-memory.db")
+retriever = MemoryRetriever(store, robot_id="arm-1")
+now = datetime.now(timezone.utc)
+observation_id = store.record_observation(
+    robot_id="arm-1", observed_at=now, kind="rgbd",
+    text="red cup on table", source="front-camera",
+    entity_id="cup-7", frame_id="map", position=(1.2, 0.4, 0.8),
+    evidence_uri="mcap://run-42/frame-18",
+)
+retriever.assert_relation(
+    source_entity_id="cup-7", relation="on",
+    target_entity_id="table-2", valid_from=now,
+    evidence_event_id=observation_id,
+    status="hypothesis", confidence=0.74,
+)
+result = retriever.retrieve(
+    valid_at=now, entity_id="cup-7", text="red cup",
+    predicates=("location",), graph_hops=1,
+)
+context = result.context(max_age=timedelta(seconds=2), min_confidence=0.9)
+```
+
+`context` includes observations, relation candidates, state facts, source
+records, and event IDs. The example relation has `usable=False` because it is
+a hypothesis. A perception or verification component must supply stronger
+evidence before labeling it verified. A changed relation must be retracted or
+given a validity end; the memory does not infer that a cup moved.
+
+For a running robot, use `OnboardMemory.submit_relation(...)` and
+`retrieve_async(...)` from non-control workers. The retrieval result is shared
+structured context for question answering, planning, and VLA inputs. It does
+not answer arbitrary natural-language questions by itself. A natural-language
+front end should translate to bounded structured filters and cite the returned
+evidence. Robot code does not receive unrestricted SQL access.
+
 The hot snapshot answers current state only. It is bounded by max_hot_keys;
 eviction returns missing so callers fall back safely. It keeps at most
 max_hot_keys × history_per_key facts (capped at 4096) and may return missing for

@@ -8,6 +8,9 @@ background workers store evidence-backed facts in a local bitemporal ledger
 with two clocks: **world time** (when a state was true) and **knowledge time**
 (when the robot learned it). Historical queries, corrections, freshness
 checks, and text, time, entity, and spatial search stay off the action path.
+Evidence-backed directed scene relations and bounded retrieval now assemble
+facts, episodes, graph neighbors, and provenance for question answering,
+planning, and VLA context.
 
 Start with the [onboard memory guide](06_memory/README.md) and
 [architecture plan](06_memory/PLAN.md).

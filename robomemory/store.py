@@ -480,6 +480,54 @@ class MemoryStore:
             """, (event_id, robot_id)).fetchone()
         return self._fact(row) if row else None
 
+    def knowledge_cursor(
+        self, *, known_at: datetime | None = None,
+        known_event_id: int | None = None,
+    ) -> int:
+        """Pin one knowledge horizon for a multi-part retrieval request."""
+        with self._connect() as db:
+            return self._cursor(db, known_at, known_event_id)
+
+    def query_entity_facts(
+        self, *, robot_id: str, subject: str, valid_at: datetime,
+        known_event_id: int, predicate_prefix: str = "", limit: int = 100,
+    ) -> list[Fact]:
+        """Latest live assertion per predicate for one entity and horizon.
+
+        Callers must inspect status, confidence, age and expiry before using
+        these assertions for planning. A newer uncertain assertion still wins.
+        """
+        robot_id = _nonempty(robot_id, "robot_id")
+        subject = _nonempty(subject, "subject")
+        _positive_limit(limit)
+        if not isinstance(predicate_prefix, str):
+            raise ValueError("predicate_prefix must be a string")
+        valid_us = _micros(valid_at)
+        with self._connect() as db:
+            cursor = self._cursor(db, None, known_event_id)
+            rows = db.execute("""
+                WITH ranked AS (
+                    SELECT f.*, e.robot_id, e.recorded_at_us,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY f.predicate
+                               ORDER BY f.valid_from_us DESC, f.event_id DESC
+                           ) AS state_rank
+                    FROM facts f JOIN events e ON e.id=f.event_id
+                    WHERE e.robot_id=? AND f.subject=? AND f.valid_from_us<=?
+                      AND f.event_id<=?
+                      AND substr(f.predicate, 1, length(?))=?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM retractions r
+                          WHERE r.target_fact_event_id=f.event_id
+                            AND r.event_id<=?
+                      )
+                )
+                SELECT * FROM ranked WHERE state_rank=1
+                ORDER BY predicate ASC LIMIT ?
+            """, (robot_id, subject, valid_us, cursor, predicate_prefix,
+                  predicate_prefix, cursor, limit)).fetchall()
+        return [self._fact(row) for row in rows]
+
     def active_facts_snapshot(
         self, *, robot_id: str, subject: str, predicate: str, limit: int = 8,
     ) -> tuple[int, list[Fact]]:
