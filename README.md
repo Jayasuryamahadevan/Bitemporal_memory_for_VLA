@@ -1,14 +1,16 @@
 # Bitemporal Memory for Embodied AI
 
-This repository contains a queryable memory record for embodied agents, a
+This repository contains an onboard memory runtime for embodied agents, a
 research survey, and early MuJoCo arm-control lessons.
 
-The memory package stores sourced observations and facts with two clocks:
-**world time** (when a state was true) and **knowledge time** (when the robot
-learned it). It supports historical state queries, corrections and retractions,
-freshness checks, and text, time, entity, and spatial search.
+The controller-facing memory read is an immutable in-RAM snapshot. Bounded
+background workers store evidence-backed facts in a local bitemporal ledger
+with two clocks: **world time** (when a state was true) and **knowledge time**
+(when the robot learned it). Historical queries, corrections, freshness
+checks, and text, time, entity, and spatial search stay off the action path.
 
-Start with the [memory guide](06_memory/README.md) and [architecture plan](06_memory/PLAN.md).
+Start with the [onboard memory guide](06_memory/README.md) and
+[architecture plan](06_memory/PLAN.md).
 Run the demonstration and tests from the repository root:
 
 ```bash

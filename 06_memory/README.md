@@ -1,127 +1,150 @@
-# Embodied memory: queryable record layer
+# Onboard memory for embodied AI
 
-`robomemory` stores observations and evidence-backed state for one or more
-robots. It supports two forms of time travel:
+This package is designed to run on the robot's onboard computer. It separates
+the action path from durable recording:
 
-- **World time:** “Where was `cup-7` at 10:15?” (`valid_at`)
-- **Knowledge time:** “What did the robot believe then, before a late frame or
-  correction arrived?” (`known_event_id` or `known_at`)
+- The controller reads the latest immutable RAM snapshot.
+- Background workers append evidence and facts to the local bitemporal ledger.
+- Historical, text, and spatial queries run asynchronously away from motor control.
 
-The record is separate from the reflex/action loops in `research.md`. It never
-generates motor commands. Perception, tracking, progress verification, and
-coordinate transforms are upstream. This package stores their results and
-lets a planner or operator inspect the exact evidence.
+Python is not a hard real-time runtime. A hard real-time C++ controller should
+consume the latest fixed-size snapshot over shared memory or a latest-value
+ROS 2 topic. The snapshot read in this package performs no database or network
+I/O, but still inherits Python scheduling and garbage-collection jitter.
 
-## Quick start
-
-From the repository root, run:
+## Start here
 
 ```bash
-.venv/bin/python 06_memory/demo.py
-.venv/bin/python -m unittest discover -s tests -v
+python 06_memory/demo.py
+python -m unittest discover -s tests -v
 ```
 
-The Python API is the intended integration point:
+The lower-level MemoryStore API is useful for offline tools, replay, and tests.
+Robot processes should use OnboardMemory:
 
 ```python
 from datetime import datetime, timedelta, timezone
-from robomemory import MemoryStore
+from robomemory import OnboardMemory
 
-memory = MemoryStore("robot_memory.db")
-t = datetime(2026, 10, 16, 10, 0, tzinfo=timezone.utc)
+memory = OnboardMemory(
+    "/var/lib/robot-memory/arm-1.db",
+    robot_id="arm-1",
+    write_queue_capacity=256,
+    reserved_critical_slots=16,
+    max_hot_keys=512,
+)
 
-observation_id = memory.record_observation(
-    robot_id="arm-1", episode_id="sort-42", observed_at=t,
-    kind="vision", text="red cup on left table", source="wrist-camera",
-    entity_id="cup-7", frame_id="map", position=(1.2, 0.4, 0.8),
-    evidence_uri="mcap://sort-42/camera/0182", metadata={"tracker": "v3"},
+# This runs in a perception/recorder worker, never in the motor callback.
+seen = memory.submit_observation(
+    observed_at=datetime.now(timezone.utc),
+    kind="vision",
+    text="red cup on left table",
+    source="wrist-camera",
+    episode_id="sort-42",
+    entity_id="cup-7",
+    frame_id="map",
+    position=(1.2, 0.4, 0.8),
+    evidence_uri="mcap://sort-42/camera/0182",
+    metadata={"tracker": "v3"},
     idempotency_key="sort-42/camera/0182",
 )
-fact_id = memory.assert_fact(
-    robot_id="arm-1", subject="cup-7", predicate="location",
-    value="left table", valid_from=t, evidence_event_id=observation_id,
-    status="verified", confidence=0.96,
+observation_id = seen.result(timeout=1)  # wait only in this worker
+assertion = memory.submit_fact(
+    subject="cup-7",
+    predicate="location",
+    value="left table",
+    valid_from=datetime.now(timezone.utc),
+    evidence_event_id=observation_id,
+    status="verified",
+    confidence=0.96,
 )
-answer = memory.query_state(
-    robot_id="arm-1", subject="cup-7", predicate="location",
-    valid_at=t + timedelta(seconds=5), max_age=timedelta(seconds=30),
+assertion.result(timeout=1)  # still outside the action loop
+
+# Controller-facing call: in-memory lookup, no SQL or RPC.
+controller_cycle_time_utc = datetime.now(timezone.utc)  # use the robot clock
+state = memory.read_state(
+    subject="cup-7",
+    predicate="location",
+    now=controller_cycle_time_utc,
+    max_age=timedelta(seconds=2),
 )
-assert answer.status == "verified"
-assert answer.fact.evidence_event_id == observation_id
+if state.status != "verified":
+    # Use the robot's existing conservative/sensor-driven fallback.
+    pass
+
+# Historical queries are asynchronous and must also stay off the control loop.
+past = memory.query_state_async(
+    subject="cup-7",
+    predicate="location",
+    valid_at=datetime.now(timezone.utc),
+).result(timeout=2)
+
+# Call during non-real-time lifecycle shutdown.
+memory.close(timeout=5)
 ```
 
-`verified` means an upstream check has confirmed the state. A detector guess
-should be stored as `hypothesis`; a failed or occluded check can be stored as
-`unknown` with a `null` value. The latest assertion blocks older state even
-when it is unverified. Set `max_age` for dynamic facts. A returned `verified`
-status is evidence provenance, not a guarantee that perception was correct.
+Pass the controller's current UTC timestamp as now; the read does not sample a
+clock. read_state returns one of verified, hypothesis, unknown, stale, expired, or
+missing. The latest applicable state blocks fallback to an older value when it
+is uncertain or expired. Pass a freshness limit for dynamic predicates. A
+verified label records upstream verification; it is not a guarantee that the
+perception system was correct.
 
-To inspect what was known before a later update, pass the earlier `fact_id` as
-`known_event_id`. The returned `known_event_id` is the exact replay cursor.
-Use `known_at` for wall-clock queries where an exact event cursor is unavailable.
-`history()` shows assertions and subsequent retractions.
+## Time travel and query
 
-Search the episode record with any combination of text, time interval, entity,
-episode, and radius in a named coordinate frame:
+The persistent store has two clocks:
 
-```python
-hits = memory.search_observations(
-    robot_id="arm-1", text="red cup", entity_id="cup-7",
-    observed_from=t, observed_until=t + timedelta(minutes=1),
-    near=(1.2, 0.4, 0.8), radius=0.5, frame_id="map",
-)
-```
+- valid_at: when a fact was true in the physical world.
+- known_event_id or known_at: what the robot had recorded by then.
 
-Text search uses token matching (all query words) and BM25 ranking. It is not
-vector or language-model retrieval. The exact event text and evidence URI are
-returned so an operator or slower semantic service can inspect the raw record.
+Use query_state_async, history_async, or search_observations_async for
+historical lookup. A query returns fact and evidence event IDs. Text matching
+uses all query terms with BM25 ranking; it is not vector search or an
+unconstrained language-model answer. A slower planner may translate a natural
+language request into these structured queries, then cite the returned
+evidence.
 
-## CLI
+The hot snapshot answers current state only. It is bounded by max_hot_keys;
+eviction returns missing so callers fall back safely. At startup it loads the
+latest valid state per predicate from the local ledger. Do not declare memory
+ready until the runtime has been constructed and hydration succeeds.
 
-```bash
-.venv/bin/python -m robomemory --db /tmp/robot.db observe \
-  --robot arm-1 --at 2026-10-16T10:00:00Z --kind vision \
-  --text "red cup on left table" --source wrist-camera \
-  --entity cup-7 --frame map --position 1.2 0.4 0.8
+## Queues and failure handling
 
-.venv/bin/python -m robomemory --db /tmp/robot.db assert \
-  --robot arm-1 --subject cup-7 --predicate location \
-  --value '"left table"' --at 2026-10-16T10:00:00Z --evidence 1
+- submit_observation, submit_fact, and submit_retraction return a
+  WriteReceipt. Do not wait on it from a control callback.
+- If the bounded writer queue is full, submission raises MemoryQueueFull
+  immediately and increments writes_rejected. Handle it as an explicit loss:
+  low-value telemetry may be sampled or dropped. Reserved slots are available
+  to fact/retraction writes and to observations submitted with critical=True.
+  Safety-critical handling must trigger the controller's existing safe
+  behavior and operator fault path if even that capacity is exhausted.
+- Historical query submission is capped. MemoryQueryBusy means retry or
+  degrade the non-critical query; never wait for query capacity from a control
+  callback.
+- Database/write failures fail the receipt. stats() exposes accepted,
+  completed, failed, and rejected writes plus queue depth, high-water mark,
+  cache size, and a degraded flag. Keep using the last committed snapshot only
+  within its freshness limits.
+- close() drains accepted writes and waits for in-flight queries up to its
+  timeout. Call it from process lifecycle management, not from control.
 
-.venv/bin/python -m robomemory --db /tmp/robot.db state \
-  --robot arm-1 --subject cup-7 --predicate location \
-  --at 2026-10-16T10:00:05Z --max-age-seconds 30
+## Storage boundaries
 
-.venv/bin/python -m robomemory --db /tmp/robot.db search \
-  --robot arm-1 --text "red cup" --near 1.2 0.4 0.8 \
-  --radius 0.5 --frame map
-```
+SQLite WAL is the onboard semantic/event ledger, on a local filesystem. It is
+single-host storage, not a fleet database. High-rate sensor streams, images,
+and video should go to rosbag2/MCAP or a bounded local media store; the ledger
+keeps their durable evidence URIs. Position values must already be transformed
+into the named frame at the source timestamp. An upstream tracker owns stable
+entity IDs and uncertainty.
 
-The CLI emits JSON. `observe` and `assert` return event IDs. `state` can take
-`--known-event-id` or `--known-at`; `history` and `search` accept the same
-knowledge cutoff. `retract` requires a new observation and reason.
+This schema expects one timezone-aware robot clock converted to UTC. Do not
+mix wall-clock, simulation-clock, or monotonic device timestamps. A ROS 2
+integration must add an explicit clock domain and boot identifier before it
+merges event times across clock resets or replay.
 
-## Operational boundaries
-
-- SQLite WAL permits concurrent readers and serialized writers on **one
-  host**. Keep the database on a local filesystem. The schema version is
-  checked on startup. Writes are transactional, idempotency keys guard retries,
-  and each robot's evidence is isolated.
-- Store raw frames, video, and high-rate telemetry in a media recorder such as
-  ROS bag/MCAP. Put durable record URIs in `evidence_uri`; do not put images or
-  high-rate control samples into this semantic ledger.
-- Use a stable tracker ID for `subject` and `entity_id`. `frame_id` is literal:
-  spatial search compares only positions already expressed in the **same**
-  coordinate frame. Perform transforms at the observation timestamp before
-  writing, using the robot's transform system.
-- Reconcile contradictory evidence upstream. A retraction preserves the old
-  knowledge view. Follow a retraction with a corrected assertion or an
-  `unknown` assertion when the physical state remains uncertain.
-- A robot fleet or remote service will need server storage, access control,
-  replication, schema migrations, backup/restore, and latency monitoring.
-  This package is a durable single-host foundation, not a validated autonomy
-  stack. The task-level evaluation path is in `PLAN.md`.
-
-Design rationale follows the existing [research survey](../research.md) and
-the primary [SQLite WAL](https://www.sqlite.org/wal.html) and
-[FTS5](https://www.sqlite.org/fts5.html) documentation.
+For a robot fleet, add authenticated replication, encrypted transport,
+retention/rotation, backup and restore, disk-health alarms, schema migration,
+and recovery drills. None of those can be validated against this repository's
+current MuJoCo-only lessons. Measure on the target computer before making
+latency or task-success claims.

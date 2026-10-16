@@ -448,6 +448,44 @@ class MemoryStore:
             """, (cursor, robot_id, subject, predicate, cursor, limit)).fetchall()
         return [{"fact": self._fact(row), "retracted_by": row["retracted_by"]} for row in rows]
 
+    def get_fact(self, *, robot_id: str, event_id: int) -> Fact | None:
+        """Fetch one immutable assertion by its event ID."""
+        with self._connect() as db:
+            row = db.execute("""
+                SELECT f.*, e.robot_id, e.recorded_at_us FROM facts f
+                JOIN events e ON e.id=f.event_id
+                WHERE f.event_id=? AND e.robot_id=?
+            """, (event_id, robot_id)).fetchone()
+        return self._fact(row) if row else None
+
+    def latest_facts(
+        self, *, robot_id: str, valid_at: datetime, limit: int = 1024,
+    ) -> tuple[int, list[Fact]]:
+        """Load the latest non-retracted state per subject/predicate for boot."""
+        robot_id = _nonempty(robot_id, "robot_id")
+        _positive_limit(limit)
+        valid_us = _micros(valid_at)
+        with self._connect() as db:
+            cursor = db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+            rows = db.execute("""
+                WITH candidates AS (
+                    SELECT f.*, e.robot_id, e.recorded_at_us,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY f.subject, f.predicate
+                               ORDER BY f.valid_from_us DESC, f.event_id DESC
+                           ) AS state_rank
+                    FROM facts f JOIN events e ON e.id=f.event_id
+                    WHERE e.robot_id=? AND f.valid_from_us<=? AND f.event_id<=?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM retractions r
+                        WHERE r.target_fact_event_id=f.event_id AND r.event_id<=?
+                      )
+                )
+                SELECT * FROM candidates WHERE state_rank=1
+                ORDER BY valid_from_us DESC, event_id DESC LIMIT ?
+            """, (robot_id, valid_us, cursor, cursor, limit)).fetchall()
+        return cursor, [self._fact(row) for row in rows]
+
     @staticmethod
     def _observation(row: sqlite3.Row) -> Observation:
         position = (row["x"], row["y"], row["z"]) if row["x"] is not None else None
