@@ -19,8 +19,9 @@ network call, model call, or wait. Snapshot replacement happens after a
 background commit. Missing, unknown, expired, or stale state is explicit and
 must route to the controller's conservative fallback.
 
-The snapshot is capped by max_hot_keys; eviction returns missing, never a
-fabricated old value. A snapshot carries a generation and event cursor. Its
+The snapshot is capped by max_hot_keys and history_per_key, with at most 4096
+facts. Eviction returns missing, never a fabricated old value. A snapshot
+carries a generation and event cursor. Its
 read is O(1) in this Python process, but Python scheduling and garbage
 collection are not hard real-time. A hard real-time C++ controller should read
 a fixed-size shared-memory page or a latest-value ROS 2 message (KEEP_LAST,
@@ -36,6 +37,12 @@ available to facts, retractions, and explicitly critical observations;
 best-effort observations cannot consume that reserve. Callers must handle
 rejection and raise an operator fault for safety-critical evidence. They must
 never wait for the queue in a control callback.
+
+Accepted submissions detach caller-owned data and enforce a per-event byte
+limit before queueing. Keep exactly one runtime writer per robot identity;
+external writes require restart hydration because they do not update the hot
+snapshot. Startup hydration loads bounded live histories without assuming the
+wall clock is the simulator's valid-time clock.
 
 Historical state, text, and spatial queries run on a separate bounded worker
 pool. Saturation returns MemoryQueryBusy. Callers consume receipts and query

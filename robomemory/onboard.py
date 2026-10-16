@@ -12,8 +12,11 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
+import copy
+import json
 import queue
 import threading
 import time
@@ -47,6 +50,10 @@ class MemoryQueryBusy(RuntimeError):
 
 class MemoryRuntimeClosed(RuntimeError):
     pass
+
+
+class MemoryPayloadTooLarge(ValueError):
+    """A write exceeds the configured per-event payload limit."""
 
 
 class WriteReceipt:
@@ -142,17 +149,21 @@ class OnboardMemory:
     """
 
     def __init__(
-        self, path: str, *, robot_id: str, write_queue_capacity: int = 256,
+        self, path: str | Path, *, robot_id: str, write_queue_capacity: int = 256,
         reserved_critical_slots: int = 16, max_hot_keys: int = 512,
         query_workers: int = 2,
         max_inflight_queries: int = 16, history_per_key: int = 8,
+        max_write_bytes: int = 65536,
     ) -> None:
-        if min(write_queue_capacity, max_hot_keys, query_workers,
-               max_inflight_queries, history_per_key) < 1:
+        capacities = (write_queue_capacity, max_hot_keys, query_workers,
+                      max_inflight_queries, history_per_key, max_write_bytes)
+        if any(type(value) is not int or value < 1 for value in capacities):
             raise ValueError("runtime capacities must be positive")
-        if max_hot_keys > 1000:
-            raise ValueError("max_hot_keys cannot exceed 1000")
-        if not 0 <= reserved_critical_slots < write_queue_capacity:
+        if max_hot_keys > 1000 or history_per_key > 1000:
+            raise ValueError("max_hot_keys and history_per_key cannot exceed 1000")
+        if max_hot_keys * history_per_key > 4096:
+            raise ValueError("hot snapshot capacity cannot exceed 4096 facts")
+        if type(reserved_critical_slots) is not int or not 0 <= reserved_critical_slots < write_queue_capacity:
             raise ValueError("reserved_critical_slots must be >= 0 and below queue capacity")
         if not isinstance(robot_id, str) or not robot_id.strip():
             raise ValueError("robot_id must be a nonempty string")
@@ -162,14 +173,17 @@ class OnboardMemory:
         self._reserved_critical_slots = reserved_critical_slots
         self._max_hot_keys = max_hot_keys
         self._history_per_key = history_per_key
+        self._max_write_bytes = max_write_bytes
         now = datetime.now(UTC)
-        cursor, boot_facts = self._store.latest_facts(
-            robot_id=self.robot_id, valid_at=now, limit=max_hot_keys,
+        cursor, boot_facts = self._store.hot_facts(
+            robot_id=self.robot_id, max_keys=max_hot_keys,
+            history_per_key=history_per_key,
         )
-        initial = {
-            (fact.robot_id, fact.subject, fact.predicate): (_freeze_fact(fact),)
-            for fact in boot_facts
-        }
+        initial_lists: dict[Key, list[Fact]] = {}
+        for fact in boot_facts:
+            key = (fact.robot_id, fact.subject, fact.predicate)
+            initial_lists.setdefault(key, []).append(_freeze_fact(fact))
+        initial = {key: tuple(facts) for key, facts in initial_lists.items()}
         self._snapshot = MemorySnapshot(1, now, cursor, MappingProxyType(initial))
         self._submit_lock = threading.Lock()
         self._metrics_lock = threading.Lock()
@@ -212,6 +226,7 @@ class OnboardMemory:
 
     def _submit_write(self, operation: str, kwargs: dict[str, Any], *,
                       critical: bool) -> WriteReceipt:
+        kwargs = self._prepare_write_kwargs(kwargs)
         with self._submit_lock:
             if self._closed:
                 raise MemoryRuntimeClosed("memory runtime is closed")
@@ -237,6 +252,24 @@ class OnboardMemory:
                     self._queue_high_water, self._write_queue.qsize()
                 )
             return receipt
+
+    def _prepare_write_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Detach caller-owned values and bound each queued job by bytes."""
+        detached = copy.deepcopy(kwargs)
+        size_view = {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in detached.items()
+        }
+        try:
+            encoded = json.dumps(size_view, sort_keys=True, separators=(",", ":"),
+                                 allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("memory write fields must be JSON-compatible") from exc
+        if len(encoded) > self._max_write_bytes:
+            raise MemoryPayloadTooLarge(
+                f"memory write exceeds {self._max_write_bytes} bytes"
+            )
+        return detached
 
     def submit_observation(self, *, critical: bool = False,
                            **kwargs: Any) -> WriteReceipt:
@@ -309,13 +342,13 @@ class OnboardMemory:
                     else:
                         self._advance_cursor(event_id)
                     result = event_id
-                job.receipt._resolve(result)
                 with self._metrics_lock:
                     self._completed += 1
+                job.receipt._resolve(result)
             except BaseException as exc:
-                job.receipt._resolve(error=exc)
                 with self._metrics_lock:
                     self._failed += 1
+                job.receipt._resolve(error=exc)
             finally:
                 self._write_queue.task_done()
 
@@ -327,18 +360,17 @@ class OnboardMemory:
 
     def _refresh_key(self, robot_id: str, subject: str, predicate: str,
                      known_event_id: int) -> None:
-        cursor, rows = self._store.history_snapshot(
+        cursor, facts = self._store.active_facts_snapshot(
             robot_id=robot_id, subject=subject, predicate=predicate,
             limit=self._history_per_key,
         )
-        self._publish_history(robot_id, subject, predicate, rows,
+        self._publish_history(robot_id, subject, predicate, facts,
                               max(cursor, known_event_id))
 
     def _publish_history(self, robot_id: str, subject: str, predicate: str,
-                         rows: list[dict[str, Any]], known_event_id: int) -> None:
+                         active_facts: list[Fact], known_event_id: int) -> None:
         key = (robot_id, subject, predicate)
-        facts = tuple(_freeze_fact(item["fact"]) for item in rows
-                      if item["retracted_by"] is None)
+        facts = tuple(_freeze_fact(fact) for fact in active_facts)
         old = self._snapshot
         updated = dict(old.facts)
         if facts:

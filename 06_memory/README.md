@@ -26,7 +26,7 @@ robot headlessly. Gymnasium ships the Ant MJCF model with its package; install
 the simulator and model dependency with:
 
 ```bash
-python -m pip install -r 06_memory/requirements-sim.txt
+python -m pip install -e '.[sim]'
 python -m unittest discover -s tests -p 'test_mujoco_integration.py' -v
 ```
 
@@ -59,6 +59,8 @@ memory = OnboardMemory(
     write_queue_capacity=256,
     reserved_critical_slots=16,
     max_hot_keys=512,
+    history_per_key=8,
+    max_write_bytes=65536,
 )
 
 # This runs in a perception/recorder worker, never in the motor callback.
@@ -132,14 +134,21 @@ language request into these structured queries, then cite the returned
 evidence.
 
 The hot snapshot answers current state only. It is bounded by max_hot_keys;
-eviction returns missing so callers fall back safely. At startup it loads the
-latest valid state per predicate from the local ledger. Do not declare memory
+eviction returns missing so callers fall back safely. It keeps at most
+max_hot_keys × history_per_key facts (capped at 4096) and may return missing for
+an older state outside that window; use the durable query for time travel. At
+startup it loads bounded live histories for keys with the newest live assertions,
+including facts whose valid time is ahead of wall time. Do not declare memory
 ready until the runtime has been constructed and hydration succeeds.
 
 ## Queues and failure handling
 
 - submit_observation, submit_fact, and submit_retraction return a
   WriteReceipt. Do not wait on it from a control callback.
+- Each submission detaches caller-owned data before queueing. JSON-compatible
+  write fields are limited to max_write_bytes (65,536 by default); oversized
+  writes raise MemoryPayloadTooLarge. Submit from a worker, since copying and
+  validation consume CPU. Do not mutate an input concurrently with submission.
 - If the bounded writer queue is full, submission raises MemoryQueueFull
   immediately and increments writes_rejected. Handle it as an explicit loss:
   low-value telemetry may be sampled or dropped. Reserved slots are available
@@ -164,6 +173,11 @@ and video should go to rosbag2/MCAP or a bounded local media store; the ledger
 keeps their durable evidence URIs. Position values must already be transformed
 into the named frame at the source timestamp. An upstream tracker owns stable
 entity IDs and uncertainty.
+
+One OnboardMemory instance must own writes for a robot while it is running.
+Writes made directly through another MemoryStore or runtime do not notify the
+hot snapshot. Restart the runtime to hydrate external changes, or route every
+write through its queue.
 
 This schema expects one timezone-aware robot clock converted to UTC. Do not
 mix wall-clock, simulation-clock, or monotonic device timestamps. A ROS 2

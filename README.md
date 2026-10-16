@@ -11,9 +11,11 @@ checks, and text, time, entity, and spatial search stay off the action path.
 
 Start with the [onboard memory guide](06_memory/README.md) and
 [architecture plan](06_memory/PLAN.md).
-Run the demonstration and tests from the repository root:
+Install the core package, then run the demonstration and tests from the
+repository root:
 
 ```bash
+python -m pip install -e .
 python 06_memory/demo.py
 python -m unittest discover -s tests -v
 ```

@@ -19,7 +19,7 @@ from robomemory import OnboardMemory
 UTC = timezone.utc
 
 
-@unittest.skipUnless(gym is not None, "install 06_memory/requirements-sim.txt")
+@unittest.skipUnless(gym is not None, "install the project with the sim extra")
 class MuJoCoMemoryIntegrationTest(unittest.TestCase):
     def test_ant_sensor_states_are_queryable_across_simulated_time(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -29,7 +29,9 @@ class MuJoCoMemoryIntegrationTest(unittest.TestCase):
             try:
                 env.reset(seed=7)
                 env.action_space.seed(11)
-                sim_epoch = datetime.now(UTC)
+                # A simulator may run ahead of wall time. Startup hydration
+                # must still restore its latest committed state.
+                sim_epoch = datetime.now(UTC) + timedelta(minutes=1)
                 samples: list[tuple[datetime, int, tuple[float, float, float]]] = []
 
                 def capture(step: int) -> None:
@@ -67,7 +69,7 @@ class MuJoCoMemoryIntegrationTest(unittest.TestCase):
                     if step % 5 == 0:
                         capture(step)
 
-                first_time, first_event, first_pose = samples[0]
+                _, first_event, first_pose = samples[0]
                 last_time, last_event, last_pose = samples[-1]
                 self.assertNotEqual(first_pose, last_pose, "MuJoCo produced no pose change")
 
@@ -90,6 +92,15 @@ class MuJoCoMemoryIntegrationTest(unittest.TestCase):
                     subject="ant/base", predicate="pose_xyz_m", now=last_time,
                 )
                 self.assertEqual(cached.fact.event_id, last_event)
+                self.assertTrue(memory.close(timeout=3))
+                restarted = OnboardMemory(Path(temp) / "ant-memory.db", robot_id=robot_id)
+                try:
+                    recovered = restarted.read_state(
+                        subject="ant/base", predicate="pose_xyz_m", now=last_time,
+                    )
+                    self.assertEqual(recovered.fact.event_id, last_event)
+                finally:
+                    self.assertTrue(restarted.close(timeout=3))
             finally:
                 self.assertTrue(memory.close(timeout=3))
                 env.close()

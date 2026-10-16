@@ -4,11 +4,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import threading
-import time
 import unittest
 
 from robomemory import (
-    MemoryQueueFull, MemoryQueryBusy, MemoryRuntimeClosed, MemoryStore,
+    MemoryPayloadTooLarge, MemoryQueueFull, MemoryQueryBusy,
+    MemoryRuntimeClosed, MemoryStore,
     OnboardMemory,
 )
 
@@ -119,6 +119,155 @@ class OnboardMemoryTest(unittest.TestCase):
         )
         self.assertEqual(answer.fact.event_id, new_fact)
         self.assertEqual(answer.fact.value, "drawer")
+
+    def test_future_fact_and_prior_state_survive_restart(self):
+        evidence = self.observation().result(timeout=3)
+        earlier = self.fact(evidence, value="table").result(timeout=3)
+        future_time = datetime.now(UTC) + timedelta(days=1)
+        future_evidence = self.observation(
+            observed_at=future_time, text="cup on future shelf",
+        ).result(timeout=3)
+        later = self.fact(
+            future_evidence, value="shelf", valid_from=future_time,
+        ).result(timeout=3)
+        self.assertTrue(self.memory.close(timeout=3))
+
+        restarted = OnboardMemory(self.path, robot_id="r1", history_per_key=2)
+        try:
+            before = restarted.read_state(
+                subject="cup-7", predicate="location", now=future_time - timedelta(seconds=1),
+            )
+            after = restarted.read_state(
+                subject="cup-7", predicate="location", now=future_time,
+            )
+            self.assertEqual(before.fact.event_id, earlier)
+            self.assertEqual(after.fact.event_id, later)
+        finally:
+            self.assertTrue(restarted.close(timeout=3))
+
+    def test_retractions_beyond_cache_history_reveal_older_live_fact(self):
+        self.assertTrue(self.memory.close(timeout=3))
+        memory = OnboardMemory(self.path, robot_id="r1", history_per_key=2)
+        try:
+            first_obs = self.observation(memory).result(timeout=3)
+            oldest = memory.submit_fact(
+                subject="cup-7", predicate="location", value="table",
+                valid_from=T0, evidence_event_id=first_obs,
+            ).result(timeout=3)
+            recent = []
+            for minute in range(1, 5):
+                at = T0 + timedelta(minutes=minute)
+                observation = self.observation(
+                    memory, observed_at=at, text=f"cup at position {minute}",
+                ).result(timeout=3)
+                fact = memory.submit_fact(
+                    subject="cup-7", predicate="location", value=f"spot-{minute}",
+                    valid_from=at, evidence_event_id=observation,
+                ).result(timeout=3)
+                recent.append(fact)
+            correction = self.observation(
+                memory, observed_at=T0 + timedelta(minutes=5), text="tracker corrected",
+            ).result(timeout=3)
+            for fact in reversed(recent):
+                memory.submit_retraction(
+                    fact_event_id=fact, evidence_event_id=correction,
+                    observed_at=T0 + timedelta(minutes=5), reason="false detection",
+                ).result(timeout=3)
+            answer = memory.read_state(
+                subject="cup-7", predicate="location", now=T0 + timedelta(minutes=6),
+            )
+            self.assertEqual(answer.fact.event_id, oldest)
+            self.assertEqual(answer.fact.value, "table")
+        finally:
+            self.assertTrue(memory.close(timeout=3))
+
+    def test_enqueued_value_is_detached_and_payload_size_is_bounded(self):
+        evidence = self.observation().result(timeout=3)
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.memory._store.assert_fact
+
+        def blocked_fact(**kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("test writer release timed out")
+            return original(**kwargs)
+
+        self.memory._store.assert_fact = blocked_fact
+        value = {"pose": [1, 2, 3]}
+        receipt = self.fact(evidence, value=value)
+        self.assertTrue(entered.wait(2))
+        value["pose"][0] = 999
+        release.set()
+        receipt.result(timeout=3)
+        durable = self.memory.query_state_async(
+            subject="cup-7", predicate="location", valid_at=T0,
+        ).result(timeout=3)
+        self.assertEqual(durable.fact.value, {"pose": [1, 2, 3]})
+
+        with self.assertRaises(MemoryPayloadTooLarge):
+            self.memory.submit_observation(
+                observed_at=T0, kind="vision", text="x" * 70000, source="camera",
+            )
+        self.assertEqual(self.memory.stats().writes_accepted, 2)
+
+    def test_invalid_memory_bounds_fail_at_startup(self):
+        for kwargs in ({"history_per_key": 1001}, {"max_hot_keys": 1000},
+                       {"max_write_bytes": 0}, {"write_queue_capacity": 1.5}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                OnboardMemory(self.path, robot_id="r1", **kwargs)
+
+    def test_boot_cache_evicts_oldest_key_after_new_state(self):
+        self.assertTrue(self.memory.close(timeout=3))
+        store = MemoryStore(self.path)
+        for subject in ("old", "new"):
+            observation = store.record_observation(
+                robot_id="r1", observed_at=T0, kind="vision",
+                text=f"{subject} object", source="camera",
+            )
+            store.assert_fact(
+                robot_id="r1", subject=subject, predicate="location",
+                value="table", valid_from=T0, evidence_event_id=observation,
+            )
+        memory = OnboardMemory(self.path, robot_id="r1", max_hot_keys=2)
+        try:
+            observation = memory.submit_observation(
+                observed_at=T0, kind="vision", text="latest object", source="camera",
+            ).result(timeout=3)
+            memory.submit_fact(
+                subject="latest", predicate="location", value="shelf",
+                valid_from=T0, evidence_event_id=observation,
+            ).result(timeout=3)
+            self.assertEqual(memory.read_state(
+                subject="old", predicate="location", now=T0,
+            ).status, "missing")
+            self.assertEqual(memory.read_state(
+                subject="new", predicate="location", now=T0,
+            ).fact.value, "table")
+            self.assertEqual(memory.read_state(
+                subject="latest", predicate="location", now=T0,
+            ).fact.value, "shelf")
+        finally:
+            self.assertTrue(memory.close(timeout=3))
+
+    def test_failed_assertion_does_not_publish_and_writer_recovers(self):
+        invalid = self.memory.submit_fact(
+            subject="cup-7", predicate="location", value="table",
+            valid_from=T0, evidence_event_id=999999,
+        )
+        with self.assertRaisesRegex(ValueError, "evidence must be"):
+            invalid.result(timeout=3)
+        self.assertEqual(self.memory.read_state(
+            subject="cup-7", predicate="location", now=T0,
+        ).status, "missing")
+        self.assertEqual(self.memory.stats().writes_failed, 1)
+        self.assertTrue(self.memory.stats().degraded)
+
+        observation = self.observation().result(timeout=3)
+        valid = self.fact(observation).result(timeout=3)
+        self.assertEqual(self.memory.read_state(
+            subject="cup-7", predicate="location", now=T0,
+        ).fact.event_id, valid)
 
     def test_bounded_queue_rejects_best_effort_but_preserves_reserved_slot(self):
         self.memory.close(timeout=3)

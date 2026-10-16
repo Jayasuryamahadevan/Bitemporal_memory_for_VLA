@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+build/
+*.egg-info/
+dist/
 *.db
 *.db-wal
 *.db-shm

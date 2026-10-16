@@ -101,6 +101,9 @@ class MemoryStore:
             raise ValueError("use a file path; memory is durable across connections")
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
+            # Journal mode is persistent for the database. Set it once during
+            # lifecycle startup rather than on every read connection.
+            db.execute("PRAGMA journal_mode=WAL")
             existing = {row[0] for row in db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('schema_meta','events')"
             )}
@@ -110,7 +113,8 @@ class MemoryStore:
                     raise RuntimeError("unsupported memory schema version")
             elif "events" in existing:
                 raise RuntimeError("existing memory database has no schema version")
-            db.executescript("""
+            db.executescript(f"""
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL
                 );
@@ -188,9 +192,10 @@ class MemoryStore:
                     BEFORE DELETE ON retractions BEGIN
                     SELECT RAISE(ABORT, 'retractions are append-only');
                     END;
+                INSERT OR IGNORE INTO schema_meta(key, value)
+                    VALUES ('version', '{SCHEMA_VERSION}');
+                COMMIT;
             """)
-            if "schema_meta" not in existing:
-                db.execute("INSERT INTO schema_meta VALUES ('version', ?)", (str(SCHEMA_VERSION),))
 
     @contextmanager
     def _connect(self):
@@ -199,7 +204,6 @@ class MemoryStore:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("PRAGMA busy_timeout=10000")
-            db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
             yield db
         finally:
@@ -476,14 +480,85 @@ class MemoryStore:
             """, (event_id, robot_id)).fetchone()
         return self._fact(row) if row else None
 
+    def active_facts_snapshot(
+        self, *, robot_id: str, subject: str, predicate: str, limit: int = 8,
+    ) -> tuple[int, list[Fact]]:
+        """Return live assertions and a matching knowledge cursor for one key."""
+        robot_id = _nonempty(robot_id, "robot_id")
+        subject = _nonempty(subject, "subject")
+        predicate = _nonempty(predicate, "predicate")
+        _positive_limit(limit)
+        with self._connect() as db:
+            db.execute("BEGIN")
+            cursor = self._cursor(db, None, None)
+            rows = db.execute("""
+                SELECT f.*, e.robot_id, e.recorded_at_us FROM facts f
+                JOIN events e ON e.id=f.event_id
+                WHERE e.robot_id=? AND f.subject=? AND f.predicate=?
+                  AND f.event_id<=?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM retractions r
+                    WHERE r.target_fact_event_id=f.event_id AND r.event_id<=?
+                  )
+                ORDER BY f.valid_from_us DESC, f.event_id DESC LIMIT ?
+            """, (robot_id, subject, predicate, cursor, cursor, limit)).fetchall()
+            result = [self._fact(row) for row in rows]
+            db.commit()
+        return cursor, result
+
+    def hot_facts(
+        self, *, robot_id: str, max_keys: int, history_per_key: int,
+    ) -> tuple[int, list[Fact]]:
+        """Hydrate bounded live histories, including facts valid in the future.
+
+        Keys are ordered by oldest to newest live assertion so insertion-order
+        cache eviction removes the oldest of the selected keys first.
+        """
+        robot_id = _nonempty(robot_id, "robot_id")
+        _positive_limit(max_keys)
+        _positive_limit(history_per_key)
+        with self._connect() as db:
+            db.execute("BEGIN")
+            cursor = self._cursor(db, None, None)
+            rows = db.execute("""
+                WITH active AS (
+                    SELECT f.*, e.robot_id, e.recorded_at_us,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY f.subject, f.predicate
+                               ORDER BY f.valid_from_us DESC, f.event_id DESC
+                           ) AS rank_in_key,
+                           MAX(f.event_id) OVER (
+                               PARTITION BY f.subject, f.predicate
+                           ) AS key_latest_event_id
+                    FROM facts f JOIN events e ON e.id=f.event_id
+                    WHERE e.robot_id=? AND f.event_id<=?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM retractions r
+                        WHERE r.target_fact_event_id=f.event_id AND r.event_id<=?
+                      )
+                ), selected AS (
+                    SELECT subject, predicate, key_latest_event_id
+                    FROM active WHERE rank_in_key=1
+                    ORDER BY key_latest_event_id DESC LIMIT ?
+                )
+                SELECT active.* FROM active
+                JOIN selected USING (subject, predicate)
+                WHERE active.rank_in_key<=?
+                ORDER BY selected.key_latest_event_id ASC, active.rank_in_key ASC
+            """, (robot_id, cursor, cursor, max_keys, history_per_key)).fetchall()
+            result = [self._fact(row) for row in rows]
+            db.commit()
+        return cursor, result
+
     def latest_facts(
-        self, *, robot_id: str, valid_at: datetime, limit: int = 1024,
+        self, *, robot_id: str, valid_at: datetime, limit: int = 1000,
     ) -> tuple[int, list[Fact]]:
         """Load the latest non-retracted state per subject/predicate for boot."""
         robot_id = _nonempty(robot_id, "robot_id")
         _positive_limit(limit)
         valid_us = _micros(valid_at)
         with self._connect() as db:
+            db.execute("BEGIN")
             cursor = db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
             rows = db.execute("""
                 WITH candidates AS (
@@ -502,7 +577,9 @@ class MemoryStore:
                 SELECT * FROM candidates WHERE state_rank=1
                 ORDER BY valid_from_us DESC, event_id DESC LIMIT ?
             """, (robot_id, valid_us, cursor, cursor, limit)).fetchall()
-        return cursor, [self._fact(row) for row in rows]
+            result = [self._fact(row) for row in rows]
+            db.commit()
+        return cursor, result
 
     @staticmethod
     def _observation(row: sqlite3.Row) -> Observation:
