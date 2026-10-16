@@ -327,11 +327,12 @@ class OnboardMemory:
 
     def _refresh_key(self, robot_id: str, subject: str, predicate: str,
                      known_event_id: int) -> None:
-        rows = self._store.history(
+        cursor, rows = self._store.history_snapshot(
             robot_id=robot_id, subject=subject, predicate=predicate,
-            known_event_id=known_event_id, limit=self._history_per_key,
+            limit=self._history_per_key,
         )
-        self._publish_history(robot_id, subject, predicate, rows, known_event_id)
+        self._publish_history(robot_id, subject, predicate, rows,
+                              max(cursor, known_event_id))
 
     def _publish_history(self, robot_id: str, subject: str, predicate: str,
                          rows: list[dict[str, Any]], known_event_id: int) -> None:

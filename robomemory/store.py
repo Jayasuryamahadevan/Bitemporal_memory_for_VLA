@@ -434,8 +434,23 @@ class MemoryStore:
         known_at: datetime | None = None, known_event_id: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
+        return self.history_snapshot(
+            robot_id=robot_id, subject=subject, predicate=predicate,
+            known_at=known_at, known_event_id=known_event_id, limit=limit,
+        )[1]
+
+    def history_snapshot(
+        self, *, robot_id: str, subject: str, predicate: str,
+        known_at: datetime | None = None, known_event_id: int | None = None,
+        limit: int = 100,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Read history and its transaction cursor from one SQLite snapshot."""
+        robot_id = _nonempty(robot_id, "robot_id")
+        subject = _nonempty(subject, "subject")
+        predicate = _nonempty(predicate, "predicate")
         _positive_limit(limit)
         with self._connect() as db:
+            db.execute("BEGIN")
             cursor = self._cursor(db, known_at, known_event_id)
             rows = db.execute("""
                 SELECT f.*, e.robot_id, e.recorded_at_us,
@@ -446,7 +461,10 @@ class MemoryStore:
                 WHERE e.robot_id=? AND f.subject=? AND f.predicate=? AND f.event_id<=?
                 ORDER BY f.valid_from_us DESC, f.event_id DESC LIMIT ?
             """, (cursor, robot_id, subject, predicate, cursor, limit)).fetchall()
-        return [{"fact": self._fact(row), "retracted_by": row["retracted_by"]} for row in rows]
+            result = [{"fact": self._fact(row), "retracted_by": row["retracted_by"]}
+                      for row in rows]
+            db.commit()
+        return cursor, result
 
     def get_fact(self, *, robot_id: str, event_id: int) -> Fact | None:
         """Fetch one immutable assertion by its event ID."""
