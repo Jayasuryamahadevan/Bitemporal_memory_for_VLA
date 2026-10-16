@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+01_get_a_robot/out/
+02_build_your_own_arm/out/
+MUJOCO_LOG.TXT
