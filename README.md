@@ -18,6 +18,9 @@ python 06_memory/demo.py
 python -m unittest discover -s tests -v
 ```
 
+The optional MuJoCo Ant virtual-robot integration test and install steps are
+also documented in the [onboard memory guide](06_memory/README.md).
+
 The [research survey](research.md) motivates the separation of the fast
 control loops from the off-loop queryable record. The existing arm lessons are
 in `01_get_a_robot/` and `02_build_your_own_arm/`.

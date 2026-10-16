@@ -19,6 +19,33 @@ python 06_memory/demo.py
 python -m unittest discover -s tests -v
 ```
 
+## Virtual robot validation
+
+The optional integration test runs Gymnasium's articulated MuJoCo `Ant-v5`
+robot headlessly. Gymnasium ships the Ant MJCF model with its package; install
+the simulator and model dependency with:
+
+```bash
+python -m pip install -r 06_memory/requirements-sim.txt
+python -m unittest discover -s tests -p 'test_mujoco_integration.py' -v
+```
+
+The test steps the simulated robot, records its base pose as a sourced sensor
+observation, stores evidence-linked state facts, and checks current cache reads
+and bitemporal queries at earlier and later knowledge cursors. The test uses a
+temporary local database. It validates the memory API against a simulator; it
+does not validate a ROS 2 adapter, perception, robot hardware, or control-loop
+timing. Simulation time is mapped onto an isolated UTC interval for this test;
+production integrations must carry an explicit clock domain and boot identity
+before combining simulation or device clocks with wall time.
+
+`Ant-v5` is a generic quadruped benchmark model, not a robot-specific digital
+twin. The memory API has no built-in simulator dependency: a robot or simulator
+adapter must map its own timestamps, frames, entities, and sensor output into
+the observation and fact interface. A Unitree Go2 Menagerie download was not
+available in this environment because direct model downloads could not resolve
+the network host; no Go2 hardware/model validation is claimed.
+
 The lower-level MemoryStore API is useful for offline tools, replay, and tests.
 Robot processes should use OnboardMemory:
 
