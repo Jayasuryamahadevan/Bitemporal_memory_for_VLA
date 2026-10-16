@@ -30,14 +30,14 @@ python -m pip install -e '.[sim]'
 python -m unittest discover -s tests -p 'test_mujoco_integration.py' -v
 ```
 
-The test steps the simulated robot, records its base pose as a sourced sensor
-observation, stores evidence-linked state facts, and checks current cache reads
+The test steps the simulated robot, atomically records each sourced pose and
+its evidence-linked state fact, and checks current cache reads
 and bitemporal queries at earlier and later knowledge cursors. The test uses a
 temporary local database. It validates the memory API against a simulator; it
 does not validate a ROS 2 adapter, perception, robot hardware, or control-loop
-timing. Simulation time is mapped onto an isolated UTC interval for this test;
-production integrations must carry an explicit clock domain and boot identity
-before combining simulation or device clocks with wall time.
+timing. Simulation time is mapped onto an isolated timezone-aware interval and
+bound to `sim:ant-smoke-7`. Use a new simulator run ID and database after each
+clock reset. The adapter must supply timestamps from the declared clock.
 
 `Ant-v5` is a generic quadruped benchmark model, not a robot-specific digital
 twin. The memory API has no built-in simulator dependency: a robot or simulator
@@ -56,6 +56,7 @@ from robomemory import OnboardMemory
 memory = OnboardMemory(
     "/var/lib/robot-memory/arm-1.db",
     robot_id="arm-1",
+    clock_domain="utc",  # or a unique sim:<run-id> in simulation
     write_queue_capacity=256,
     reserved_critical_slots=16,
     max_hot_keys=512,
@@ -64,30 +65,19 @@ memory = OnboardMemory(
 )
 
 # This runs in a perception/recorder worker, never in the motor callback.
-seen = memory.submit_observation(
-    observed_at=datetime.now(timezone.utc),
-    kind="vision",
-    text="red cup on left table",
-    source="wrist-camera",
-    episode_id="sort-42",
-    entity_id="cup-7",
-    frame_id="map",
-    position=(1.2, 0.4, 0.8),
-    evidence_uri="mcap://sort-42/camera/0182",
-    metadata={"tracker": "v3"},
-    idempotency_key="sort-42/camera/0182",
-)
-observation_id = seen.result(timeout=1)  # wait only in this worker
-assertion = memory.submit_fact(
-    subject="cup-7",
-    predicate="location",
-    value="left table",
-    valid_from=datetime.now(timezone.utc),
-    evidence_event_id=observation_id,
-    status="verified",
-    confidence=0.96,
-)
-assertion.result(timeout=1)  # still outside the action loop
+captured_at = datetime.now(timezone.utc)  # the frame's source timestamp
+receipt = memory.submit_bundle(
+    bundle_key="sort-42/camera/0182",
+    observation=dict(
+        observed_at=captured_at, kind="vision", text="red cup on left table",
+        source="wrist-camera", episode_id="sort-42", entity_id="cup-7",
+        frame_id="map", position=(1.2, 0.4, 0.8),
+        evidence_uri="mcap://sort-42/camera/0182",
+        metadata={"tracker": "v3"},
+    ),
+    facts=[dict(subject="cup-7", predicate="location", value="left table",
+                status="hypothesis", confidence=0.96)],
+).result(timeout=1)  # wait only in this worker
 
 # Controller-facing call: in-memory lookup, no SQL or RPC.
 controller_cycle_time_utc = datetime.now(timezone.utc)  # use the robot clock
@@ -112,12 +102,22 @@ past = memory.query_state_async(
 memory.close(timeout=5)
 ```
 
-Pass the controller's current UTC timestamp as now; the read does not sample a
-clock. read_state returns one of verified, hypothesis, unknown, stale, expired, or
+Pass the controller's current timestamp in the declared clock domain as `now`;
+the read does not sample a clock. `read_state` returns one of verified,
+hypothesis, unknown, stale, expired, or
 missing. The latest applicable state blocks fallback to an older value when it
 is uncertain or expired. Pass a freshness limit for dynamic predicates. A
 verified label records upstream verification; it is not a guarantee that the
 perception system was correct.
+
+`submit_bundle` commits one observation and up to 32 derived facts in a single
+transaction. Its receipt contains the observation and fact event IDs. Retry
+with the same bundle key and identical content to obtain the same IDs; reuse
+with changed content fails. A failed fact rolls the whole packet back. The
+hot snapshot publishes all affected keys in one swap after commit.
+`max_write_bytes` bounds the entire queued packet. Use a key unique to the
+capture or simulator run and frame. Detector output should normally be a
+hypothesis until upstream verification supports `verified`.
 
 ## Time travel and query
 
@@ -227,6 +227,14 @@ keeps their durable evidence URIs. Position values must already be transformed
 into the named frame at the source timestamp. An upstream tracker owns stable
 entity IDs and uncertainty.
 
+Each database binds `clock_domain` at startup. `utc` is the default and is
+used for existing v1 ledgers during automatic v2 migration. A populated v1
+ledger cannot be reinterpreted as simulator time. For simulation use a fresh
+database with `clock_domain="sim:<unique-run-id>"`; a different domain cannot
+open it. The adapter must keep every observation, fact, and query timestamp in
+that domain. The domain labels the timeline; it does not transform values or
+detect an incorrectly labeled timestamp.
+
 After a bulk import, `MemoryStore.optimize_search()` can compact the text
 index in a stopped robot's maintenance window. It acquires a write lock and
 must not run inside a control callback or alongside the live writer. The
@@ -239,10 +247,11 @@ Writes made directly through another MemoryStore or runtime do not notify the
 hot snapshot. Restart the runtime to hydrate external changes, or route every
 write through its queue.
 
-This schema expects one timezone-aware robot clock converted to UTC. Do not
-mix wall-clock, simulation-clock, or monotonic device timestamps. A ROS 2
-integration must add an explicit clock domain and boot identifier before it
-merges event times across clock resets or replay.
+The source clock for `observed_at`, `valid_from`, `valid_until`, and query
+`valid_at` must be consistent. Knowledge time (`recorded_at`) remains the
+host's UTC clock. A ROS 2 adapter still needs to convert source timestamps,
+apply TF at capture time, and bind per-device boot identity before merging
+device-monotonic values.
 
 For a robot fleet, add authenticated replication, encrypted transport,
 retention/rotation, backup and restore, disk-health alarms, schema migration,

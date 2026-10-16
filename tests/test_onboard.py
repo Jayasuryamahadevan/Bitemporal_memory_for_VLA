@@ -61,6 +61,40 @@ class OnboardMemoryTest(unittest.TestCase):
         self.assertEqual(async_answer.fact.value, "table")
         self.assertGreaterEqual(self.memory.stats().writes_completed, 2)
 
+    def test_bundle_publishes_all_facts_together_and_replays(self):
+        before = self.memory.snapshot.generation
+        packet = dict(observed_at=T0, kind="vision", text="red cup on table",
+                      source="front-camera", entity_id="cup-7")
+        facts = [dict(subject="cup-7", predicate="location", value="table",
+                      status="hypothesis", confidence=0.7),
+                 dict(subject="cup-7", predicate="color", value="red")]
+        receipt = self.memory.submit_bundle(
+            bundle_key="episode-1/frame-1", observation=packet, facts=facts,
+        ).result(timeout=3)
+        self.assertEqual(self.memory.snapshot.generation, before + 1)
+        self.assertEqual(self.memory.read_state(
+            subject="cup-7", predicate="location", now=T0,
+        ).status, "hypothesis")
+        self.assertEqual(self.memory.read_state(
+            subject="cup-7", predicate="color", now=T0,
+        ).fact.value, "red")
+        self.assertEqual(self.memory.submit_bundle(
+            bundle_key="episode-1/frame-1", observation=packet, facts=facts,
+        ).result(timeout=3), receipt)
+        self.assertEqual(self.memory._store.knowledge_cursor(), receipt.fact_event_ids[-1])
+
+        invalid = self.memory.submit_bundle(
+            bundle_key="episode-1/frame-2", observation=dict(packet, text="bad"),
+            facts=[dict(subject="cup-7", predicate="color", value="blue",
+                        confidence=2.0)],
+        )
+        with self.assertRaisesRegex(ValueError, "confidence"):
+            invalid.result(timeout=3)
+        self.assertEqual(self.memory._store.knowledge_cursor(), receipt.fact_event_ids[-1])
+        self.assertEqual(self.memory.read_state(
+            subject="cup-7", predicate="color", now=T0,
+        ).fact.value, "red")
+
     def test_restart_hydrates_only_this_robot_and_retraction_updates_snapshot(self):
         evidence = self.observation().result(timeout=3)
         fact_id = self.fact(evidence).result(timeout=3)

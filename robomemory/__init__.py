@@ -1,6 +1,6 @@
 """Durable, queryable, bitemporal memory for embodied agents."""
 
-from .store import MemoryStore, Observation, StateAnswer, Fact
+from .store import MemoryStore, Observation, StateAnswer, Fact, BundleReceipt
 from .onboard import (
     MemoryQueueFull, MemoryQueryBusy, MemoryRuntimeClosed,
     MemoryPayloadTooLarge,
@@ -9,7 +9,7 @@ from .onboard import (
 from .retrieval import MemoryRetriever, RelationHit, RetrievalResult, relation_predicate
 
 __all__ = [
-    "MemoryStore", "Observation", "StateAnswer", "Fact",
+    "MemoryStore", "Observation", "StateAnswer", "Fact", "BundleReceipt",
     "MemoryQueueFull", "MemoryQueryBusy", "MemoryRuntimeClosed",
     "MemoryPayloadTooLarge",
     "MemorySnapshot", "OnboardMemory", "RuntimeStats", "WriteReceipt",

@@ -21,7 +21,7 @@ import queue
 import threading
 import time
 
-from .store import Fact, MemoryStore, StateAnswer
+from .store import BundleReceipt, Fact, MemoryStore, StateAnswer, _wire
 from .retrieval import MemoryRetriever, RetrievalResult, relation_predicate
 
 
@@ -155,6 +155,7 @@ class OnboardMemory:
         query_workers: int = 2,
         max_inflight_queries: int = 16, history_per_key: int = 8,
         max_write_bytes: int = 65536,
+        clock_domain: str = "utc",
     ) -> None:
         capacities = (write_queue_capacity, max_hot_keys, query_workers,
                       max_inflight_queries, history_per_key, max_write_bytes)
@@ -169,7 +170,7 @@ class OnboardMemory:
         if not isinstance(robot_id, str) or not robot_id.strip():
             raise ValueError("robot_id must be a nonempty string")
         self.robot_id = robot_id.strip()
-        self._store = MemoryStore(path)
+        self._store = MemoryStore(path, clock_domain=clock_domain)
         self._retriever = MemoryRetriever(self._store, robot_id=self.robot_id)
         self._write_queue: queue.Queue[_WriteJob] = queue.Queue(write_queue_capacity)
         self._reserved_critical_slots = reserved_critical_slots
@@ -235,7 +236,7 @@ class OnboardMemory:
             best_effort_capacity = (
                 self._write_queue.maxsize - self._reserved_critical_slots
             )
-            if operation == "observation" and not critical and (
+            if operation in ("observation", "bundle") and not critical and (
                     self._write_queue.qsize() >= best_effort_capacity):
                 with self._metrics_lock:
                     self._rejected += 1
@@ -258,10 +259,7 @@ class OnboardMemory:
     def _prepare_write_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Detach caller-owned values and bound each queued job by bytes."""
         detached = copy.deepcopy(kwargs)
-        size_view = {
-            key: value.isoformat() if isinstance(value, datetime) else value
-            for key, value in detached.items()
-        }
+        size_view = _wire(detached)
         try:
             encoded = json.dumps(size_view, sort_keys=True, separators=(",", ":"),
                                  allow_nan=False).encode("utf-8")
@@ -278,6 +276,15 @@ class OnboardMemory:
         """Queue a sourced observation. Resolve receipt off the control path."""
         return self._submit_write("observation", self._robot_kwargs(kwargs),
                                   critical=critical)
+
+    def submit_bundle(
+        self, *, bundle_key: str, observation: dict[str, Any],
+        facts: list[dict[str, Any]], critical: bool = True,
+    ) -> WriteReceipt:
+        """Queue one atomic perception packet; receipt yields BundleReceipt."""
+        return self._submit_write("bundle", self._robot_kwargs({
+            "bundle_key": bundle_key, "observation": observation, "facts": facts,
+        }), critical=critical)
 
     def submit_fact(self, **kwargs: Any) -> WriteReceipt:
         """Queue an evidence-backed assertion; receipt yields its event ID."""
@@ -340,6 +347,13 @@ class OnboardMemory:
                     event_id = self._store.record_observation(**job.kwargs)
                     self._advance_cursor(event_id)
                     result: Any = event_id
+                elif job.operation == "bundle":
+                    result = self._store.record_bundle(**job.kwargs)
+                    keys = {(job.kwargs["robot_id"], fact["subject"], fact["predicate"])
+                            for fact in job.kwargs["facts"]}
+                    self._refresh_keys(keys, max(
+                        (result.observation_event_id, *result.fact_event_ids)
+                    ))
                 elif job.operation == "fact":
                     event_id = self._store.assert_fact(**job.kwargs)
                     self._refresh_key(job.kwargs["robot_id"], job.kwargs["subject"],
@@ -381,6 +395,28 @@ class OnboardMemory:
         )
         self._publish_history(robot_id, subject, predicate, facts,
                               max(cursor, known_event_id))
+
+    def _refresh_keys(self, keys: set[Key], known_event_id: int) -> None:
+        """Publish all keys of a committed bundle in one snapshot swap."""
+        old = self._snapshot
+        updated = dict(old.facts)
+        cursor = known_event_id
+        for robot_id, subject, predicate in sorted(keys):
+            seen, active = self._store.active_facts_snapshot(
+                robot_id=robot_id, subject=subject, predicate=predicate,
+                limit=self._history_per_key,
+            )
+            cursor = max(cursor, seen)
+            key = (robot_id, subject, predicate)
+            updated.pop(key, None)
+            if active:
+                updated[key] = tuple(_freeze_fact(fact) for fact in active)
+                if len(updated) > self._max_hot_keys:
+                    updated.pop(next(iter(updated)))
+        self._snapshot = MemorySnapshot(
+            old.generation + 1, datetime.now(UTC),
+            max(old.known_event_id, cursor), MappingProxyType(updated),
+        )
 
     def _publish_history(self, robot_id: str, subject: str, predicate: str,
                          active_facts: list[Fact], known_event_id: int) -> None:

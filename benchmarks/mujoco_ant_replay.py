@@ -30,7 +30,8 @@ def run(*, steps: int = 200, capture_every: int = 10) -> dict:
     with tempfile.TemporaryDirectory() as temp:
         path = Path(temp) / "ant.db"
         env = gym.make("Ant-v5")
-        memory = OnboardMemory(path, robot_id="mujoco-ant-benchmark")
+        memory = OnboardMemory(path, robot_id="mujoco-ant-benchmark",
+                               clock_domain="sim:ant-benchmark-7")
         samples: list[tuple[datetime, int, dict[str, float]]] = []
         query_ms: list[float] = []
         try:
@@ -43,20 +44,19 @@ def run(*, steps: int = 200, capture_every: int = 10) -> dict:
                 at = sim_epoch + timedelta(seconds=float(data.time))
                 pose = dict(zip(("x", "y", "z"),
                                 (float(v) for v in data.qpos[:3])))
-                evidence = memory.submit_observation(
-                    observed_at=at, kind="simulated-proprioception",
-                    text=f"Ant base pose step {step}", source="mujoco:Ant-v5/qpos",
-                    episode_id="ant-benchmark-7", entity_id="ant/base",
-                    frame_id="mujoco/world",
-                    position=(pose["x"], pose["y"], pose["z"]),
-                    idempotency_key=f"ant-benchmark-7/{step}/observation",
+                receipt = memory.submit_bundle(
+                    bundle_key=f"ant-benchmark-7/{step}",
+                    observation=dict(
+                        observed_at=at, kind="simulated-proprioception",
+                        text=f"Ant base pose step {step}", source="mujoco:Ant-v5/qpos",
+                        episode_id="ant-benchmark-7", entity_id="ant/base",
+                        frame_id="mujoco/world",
+                        position=(pose["x"], pose["y"], pose["z"]),
+                    ),
+                    facts=[dict(subject="ant/base", predicate="pose_xyz_m",
+                                value=pose, status="verified", confidence=1.0)],
                 ).result(timeout=5)
-                fact = memory.submit_fact(
-                    subject="ant/base", predicate="pose_xyz_m", value=pose,
-                    valid_from=at, evidence_event_id=evidence, status="verified",
-                    confidence=1.0,
-                    idempotency_key=f"ant-benchmark-7/{step}/pose",
-                ).result(timeout=5)
+                fact = receipt.fact_event_ids[0]
                 samples.append((at, fact, pose))
 
             capture(0)
@@ -84,7 +84,8 @@ def run(*, steps: int = 200, capture_every: int = 10) -> dict:
                 valid_at=last_at, known_event_id=samples[0][1],
             ).result(timeout=5)
             memory.close(timeout=5)
-            restarted = OnboardMemory(path, robot_id="mujoco-ant-benchmark")
+            restarted = OnboardMemory(path, robot_id="mujoco-ant-benchmark",
+                                       clock_domain="sim:ant-benchmark-7")
             try:
                 recovered = restarted.read_state(
                     subject="ant/base", predicate="pose_xyz_m", now=last_at,

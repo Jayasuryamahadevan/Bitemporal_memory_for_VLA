@@ -40,7 +40,7 @@ flowchart LR
   H --> C[Control path]
 ```
 
-The observation adapter is a contract for upstream perception: timestamp,
+The observation adapter is a contract for upstream perception: clock domain, timestamp,
 robot and episode identity, stable entity ID, source, optional frame and
 position, and a URI into durable media. There is no RGB-D or audio decoder in
 this repository. Relations are directed fact keys of the form
@@ -126,11 +126,18 @@ identifiers and timestamps, not camera frames or 500 Hz joint samples. Every
 position carries a coordinate-frame ID; transform it at the source timestamp
 before writing. The upstream tracker owns persistent entity IDs and
 uncertainty.
+An atomic bundle binds one observation to at most 32 derived facts in a single
+durable transaction. A stable capture key makes exact packet retries return
+the same event IDs. The hot snapshot publishes all affected keys in one swap
+after commit.
 
-The current timestamp contract is one timezone-aware robot clock converted to
-UTC. Do not mix wall-clock, simulation, or device-monotonic values. A ROS 2
-integration needs an explicit clock-domain and boot identifier in the stored
-event schema before it combines data across clock resets or replay domains.
+The timestamp contract is one timezone-aware robot clock represented as
+microseconds. Each database has a persistent `utc` or `sim:<run-id>` domain;
+opening it with another domain fails. Simulated clock resets need a new run ID
+and database. Populated v1 databases migrate as UTC and cannot be relabeled.
+The adapter must supply timestamps in that domain; the library cannot infer a
+mislabeled timestamp. ROS 2 integration still needs source clock, TF, and
+hardware boot identity adapters for per-device monotonic timestamps.
 
 ## State and safety rules
 
@@ -165,12 +172,14 @@ event schema before it combines data across clock resets or replay domains.
 3. **Implemented:** retain the append-only bitemporal ledger as source of truth.
 4. **Implemented:** bounded evidence-grounded retrieval over episodic records,
    state facts and directed scene relations, with one knowledge cursor.
-5. **Next:** integrate a real ROS 2 recorder, timestamped TF transforms, stable
+5. **Implemented:** atomic perception bundles, exact retries, persistent clock
+   domains, and conservative v1 migration.
+6. **Next:** integrate a real ROS 2 recorder, timestamped TF transforms, stable
    object tracker, and hardware identity; this repository currently has none.
-6. **Hardware gate:** measure snapshot read p50/p99/max; write acceptance and
+7. **Hardware gate:** measure snapshot read p50/p99/max; write acceptance and
    commit delay; queue high-water/rejection counts; reboot and full-disk
    recovery; stale-state errors; retrieval precision; task success.
-7. **Evaluation gate:** compare memory enabled, disabled, and conflicting/donor
+8. **Evaluation gate:** compare memory enabled, disabled, and conflicting/donor
    memory using the same task seed and current observation.
 
 The [replay benchmarks](../benchmarks/README.md) now cover lexical

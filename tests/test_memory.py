@@ -181,6 +181,63 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertEqual(len(set(ids)), 20)
         self.assertEqual(len(self.memory.search_observations(robot_id="r1", limit=20)), 20)
 
+    def test_atomic_bundle_retry_and_rollback(self):
+        observation = dict(observed_at=T0, kind="vision", text="cup on table",
+                           source="camera", entity_id="cup-7")
+        facts = [dict(subject="cup-7", predicate="location", value="table",
+                      status="hypothesis", confidence=0.8),
+                 dict(subject="cup-7", predicate="color", value="red")]
+        receipt = self.memory.record_bundle(
+            robot_id="r1", bundle_key="run-1/frame-1",
+            observation=observation, facts=facts,
+        )
+        self.assertEqual(len(receipt.fact_event_ids), 2)
+        self.assertEqual(self.memory.record_bundle(
+            robot_id="r1", bundle_key="run-1/frame-1",
+            observation=observation, facts=facts,
+        ), receipt)
+        self.assertEqual(MemoryStore(self.path).record_bundle(
+            robot_id="r1", bundle_key="run-1/frame-1",
+            observation=observation, facts=facts,
+        ), receipt)
+        self.assertEqual(len(self.memory.search_observations(robot_id="r1")), 1)
+        self.assertEqual(self.state().status, "hypothesis")
+        with self.assertRaisesRegex(ValueError, "different content"):
+            self.memory.record_bundle(robot_id="r1", bundle_key="run-1/frame-1",
+                observation=observation, facts=[dict(facts[0], value="shelf")])
+        with self.assertRaisesRegex(ValueError, "valid_until"):
+            self.memory.record_bundle(robot_id="r1", bundle_key="run-1/bad",
+                observation=dict(observation, text="bad packet"),
+                facts=[dict(subject="cup-7", predicate="shape", value="round"),
+                       dict(subject="cup-7", predicate="location", value="shelf",
+                            valid_until=T0)])
+        self.assertEqual(len(self.memory.search_observations(robot_id="r1")), 1)
+        self.assertEqual(self.memory.knowledge_cursor(), receipt.fact_event_ids[-1])
+
+    def test_clock_domain_is_bound_and_v1_migrates_conservatively(self):
+        with self.assertRaisesRegex(ValueError, "clock_domain"):
+            MemoryStore(self.path, clock_domain="sim")
+        with self.assertRaisesRegex(ValueError, "clock domain"):
+            MemoryStore(self.path, clock_domain="sim:reset-1")
+        self.observation()
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP TABLE bundles")
+            db.execute("DELETE FROM schema_meta WHERE key='clock_domain'")
+            db.execute("UPDATE schema_meta SET value='1' WHERE key='version'")
+        with self.assertRaisesRegex(ValueError, "legacy ledger"):
+            MemoryStore(self.path, clock_domain="sim:reset-1")
+        migrated = MemoryStore(self.path)
+        self.assertEqual(migrated.clock_domain, "utc")
+        self.assertEqual(len(migrated.search_observations(robot_id="r1")), 1)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute(
+                "SELECT value FROM schema_meta WHERE key='version'"
+            ).fetchone()[0], "2")
+        other_path = Path(self.temp.name) / "sim.db"
+        MemoryStore(other_path, clock_domain="sim:run-1")
+        with self.assertRaisesRegex(ValueError, "clock domain"):
+            MemoryStore(other_path, clock_domain="sim:run-2")
+
 
 if __name__ == "__main__":
     unittest.main()

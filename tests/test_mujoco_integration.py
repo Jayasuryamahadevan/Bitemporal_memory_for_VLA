@@ -25,7 +25,8 @@ class MuJoCoMemoryIntegrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             robot_id = "mujoco-ant-smoke-test"
             env = gym.make("Ant-v5")
-            memory = OnboardMemory(Path(temp) / "ant-memory.db", robot_id=robot_id)
+            memory = OnboardMemory(Path(temp) / "ant-memory.db", robot_id=robot_id,
+                                   clock_domain="sim:ant-smoke-7")
             try:
                 env.reset(seed=7)
                 env.action_space.seed(11)
@@ -38,28 +39,26 @@ class MuJoCoMemoryIntegrationTest(unittest.TestCase):
                     data = env.unwrapped.data
                     pose = tuple(float(value) for value in data.qpos[:3])
                     world_time = sim_epoch + timedelta(seconds=float(data.time))
-                    evidence_id = memory.submit_observation(
-                        observed_at=world_time,
-                        kind="simulated-proprioception",
-                        text=f"Ant base pose at simulation step {step}",
-                        source="mujoco:Ant-v5/qpos",
-                        episode_id="ant-smoke-7",
-                        entity_id="ant/base",
-                        frame_id="mujoco/world",
-                        position=pose,
-                        metadata={"simulation_time_s": float(data.time), "step": step},
-                        idempotency_key=f"ant-smoke-7/step-{step}/observation",
+                    receipt = memory.submit_bundle(
+                        bundle_key=f"ant-smoke-7/step-{step}",
+                        observation=dict(
+                            observed_at=world_time,
+                            kind="simulated-proprioception",
+                            text=f"Ant base pose at simulation step {step}",
+                            source="mujoco:Ant-v5/qpos",
+                            episode_id="ant-smoke-7",
+                            entity_id="ant/base",
+                            frame_id="mujoco/world",
+                            position=pose,
+                            metadata={"simulation_time_s": float(data.time), "step": step},
+                        ),
+                        facts=[dict(
+                            subject="ant/base", predicate="pose_xyz_m",
+                            value={"x": pose[0], "y": pose[1], "z": pose[2]},
+                            status="verified", confidence=1.0,
+                        )],
                     ).result(timeout=3)
-                    fact_id = memory.submit_fact(
-                        subject="ant/base",
-                        predicate="pose_xyz_m",
-                        value={"x": pose[0], "y": pose[1], "z": pose[2]},
-                        valid_from=world_time,
-                        evidence_event_id=evidence_id,
-                        status="verified",  # Ground truth from the simulator.
-                        confidence=1.0,
-                        idempotency_key=f"ant-smoke-7/step-{step}/pose",
-                    ).result(timeout=3)
+                    fact_id = receipt.fact_event_ids[0]
                     samples.append((world_time, fact_id, pose))
 
                 capture(step=0)
@@ -102,7 +101,8 @@ class MuJoCoMemoryIntegrationTest(unittest.TestCase):
                 )
                 self.assertEqual(cached.fact.event_id, last_event)
                 self.assertTrue(memory.close(timeout=3))
-                restarted = OnboardMemory(Path(temp) / "ant-memory.db", robot_id=robot_id)
+                restarted = OnboardMemory(Path(temp) / "ant-memory.db", robot_id=robot_id,
+                                          clock_domain="sim:ant-smoke-7")
                 try:
                     recovered = restarted.read_state(
                         subject="ant/base", predicate="pose_xyz_m", now=last_time,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import math
@@ -21,7 +21,7 @@ from typing import Any
 
 UTC = timezone.utc
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _micros(value: datetime) -> int:
@@ -38,6 +38,17 @@ def _datetime(value: int) -> datetime:
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _wire(value: Any) -> Any:
+    """Stable, JSON-safe representation for an idempotent write request."""
+    if isinstance(value, datetime):
+        return {"datetime_us": _micros(value)}
+    if isinstance(value, dict):
+        return {key: _wire(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_wire(item) for item in value]
+    return value
 
 
 def _nonempty(value: str, name: str) -> str:
@@ -92,10 +103,22 @@ class StateAnswer:
     fact: Fact | None
 
 
+@dataclass(frozen=True)
+class BundleReceipt:
+    observation_event_id: int
+    fact_event_ids: tuple[int, ...]
+
+
 class MemoryStore:
     """Single-host SQLite store. Use outside hard real-time control threads."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, clock_domain: str = "utc"):
+        if not isinstance(clock_domain, str) or (
+            clock_domain != "utc" and
+            not re.fullmatch(r"sim:[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", clock_domain)
+        ):
+            raise ValueError("clock_domain must be 'utc' or a unique 'sim:<run-id>'")
+        self.clock_domain = clock_domain
         self.path = str(path)
         if self.path == ":memory:":
             raise ValueError("use a file path; memory is durable across connections")
@@ -109,7 +132,7 @@ class MemoryStore:
             )}
             if "schema_meta" in existing:
                 row = db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
-                if row is None or row[0] != str(SCHEMA_VERSION):
+                if row is None or row[0] not in ("1", str(SCHEMA_VERSION)):
                     raise RuntimeError("unsupported memory schema version")
             elif "events" in existing:
                 raise RuntimeError("existing memory database has no schema version")
@@ -193,9 +216,51 @@ class MemoryStore:
                     SELECT RAISE(ABORT, 'retractions are append-only');
                     END;
                 INSERT OR IGNORE INTO schema_meta(key, value)
-                    VALUES ('version', '{SCHEMA_VERSION}');
+                    VALUES ('version', '1');
                 COMMIT;
             """)
+            # v1 ledgers predate clock identity. They are treated as UTC only;
+            # assigning an old populated ledger to a simulator would silently
+            # reinterpret every stored valid-time timestamp.
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                old_domain = db.execute(
+                    "SELECT value FROM schema_meta WHERE key='clock_domain'"
+                ).fetchone()
+                if old_domain is None:
+                    has_events = db.execute("SELECT 1 FROM events LIMIT 1").fetchone()
+                    if has_events and clock_domain != "utc":
+                        raise ValueError("populated legacy ledger has UTC clock domain")
+                    db.execute("INSERT INTO schema_meta VALUES ('clock_domain', ?)",
+                               (clock_domain,))
+                elif old_domain[0] != clock_domain:
+                    raise ValueError("memory clock domain does not match this ledger")
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS bundles (
+                        robot_id TEXT NOT NULL,
+                        bundle_key TEXT NOT NULL,
+                        request_hash TEXT NOT NULL,
+                        observation_event_id INTEGER NOT NULL REFERENCES events(id),
+                        fact_event_ids_json TEXT NOT NULL,
+                        PRIMARY KEY (robot_id, bundle_key)
+                    )
+                """)
+                db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS bundles_no_update
+                    BEFORE UPDATE ON bundles BEGIN
+                    SELECT RAISE(ABORT, 'bundles are append-only'); END
+                """)
+                db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS bundles_no_delete
+                    BEFORE DELETE ON bundles BEGIN
+                    SELECT RAISE(ABORT, 'bundles are append-only'); END
+                """)
+                db.execute("UPDATE schema_meta SET value=? WHERE key='version'",
+                           (str(SCHEMA_VERSION),))
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
 
     @contextmanager
     def _connect(self):
@@ -257,6 +322,7 @@ class MemoryStore:
         evidence_uri: str | None = None, frame_id: str | None = None,
         position: tuple[float, float, float] | None = None,
         metadata: Any = None, idempotency_key: str | None = None,
+        _db: sqlite3.Connection | None = None,
     ) -> int:
         robot_id = _nonempty(robot_id, "robot_id")
         kind = _nonempty(kind, "kind")
@@ -275,8 +341,9 @@ class MemoryStore:
                        entity_id=entity_id, evidence_uri=evidence_uri,
                        frame_id=frame_id, position=position, metadata=metadata)
         _json(payload)  # reject non-JSON / NaN data before opening a transaction
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self._connect() if _db is None else nullcontext(_db) as db:
+            if _db is None:
+                db.execute("BEGIN IMMEDIATE")
             event_id, inserted = self._append(
                 db, robot_id=robot_id, episode_id=episode_id, kind="observation",
                 observed_at_us=observed_at_us, entity_id=entity_id, text=text,
@@ -286,7 +353,8 @@ class MemoryStore:
             if inserted:
                 db.execute("INSERT INTO observation_fts(rowid,text,entity_id) VALUES (?,?,?)",
                            (event_id, text, entity_id or ""))
-            db.commit()
+            if _db is None:
+                db.commit()
             return event_id
 
     def assert_fact(
@@ -294,6 +362,7 @@ class MemoryStore:
         valid_from: datetime, evidence_event_id: int, status: str = "verified",
         confidence: float = 1.0, valid_until: datetime | None = None,
         idempotency_key: str | None = None,
+        _db: sqlite3.Connection | None = None,
     ) -> int:
         robot_id = _nonempty(robot_id, "robot_id")
         subject = _nonempty(subject, "subject")
@@ -313,8 +382,9 @@ class MemoryStore:
                        evidence_event_id=evidence_event_id, status=status,
                        confidence=confidence)
         value_json = _json(value)
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self._connect() if _db is None else nullcontext(_db) as db:
+            if _db is None:
+                db.execute("BEGIN IMMEDIATE")
             evidence = self._evidence(db, robot_id, evidence_event_id)
             event_id, inserted = self._append(
                 db, robot_id=robot_id, episode_id=evidence["episode_id"], kind="fact",
@@ -327,8 +397,63 @@ class MemoryStore:
                     INSERT INTO facts VALUES (?,?,?,?,?,?,?,?,?)
                 """, (event_id, subject, predicate, value_json, status,
                       from_us, until_us, confidence, evidence_event_id))
-            db.commit()
+            if _db is None:
+                db.commit()
             return event_id
+
+    def record_bundle(
+        self, *, robot_id: str, bundle_key: str,
+        observation: dict[str, Any], facts: list[dict[str, Any]],
+    ) -> BundleReceipt:
+        """Atomically record one perception packet and its derived assertions.
+
+        Bundle keys identify exact retries. A failed packet leaves no events,
+        FTS entries, facts, or bundle receipt behind.
+        """
+        robot_id = _nonempty(robot_id, "robot_id")
+        bundle_key = _nonempty(bundle_key, "bundle_key")
+        if not isinstance(observation, dict) or not isinstance(facts, list):
+            raise ValueError("observation must be a dict and facts must be a list")
+        if len(facts) > 32:
+            raise ValueError("bundle cannot contain more than 32 facts")
+        if any(not isinstance(fact, dict) for fact in facts):
+            raise ValueError("each fact must be a dict")
+        if any(key in observation for key in ("robot_id", "idempotency_key", "_db")):
+            raise ValueError("bundle observation cannot override identity or transaction")
+        if any(any(key in fact for key in
+                   ("robot_id", "evidence_event_id", "idempotency_key", "_db"))
+               for fact in facts):
+            raise ValueError("bundle facts cannot override identity, evidence, or transaction")
+        normalized_facts = [dict(fact) for fact in facts]
+        for fact in normalized_facts:
+            fact.setdefault("valid_from", observation.get("observed_at"))
+        request_hash = hashlib.sha256(_json(_wire({
+            "robot_id": robot_id, "observation": observation,
+            "facts": normalized_facts,
+        })).encode()).hexdigest()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute("""
+                SELECT request_hash, observation_event_id, fact_event_ids_json
+                FROM bundles WHERE robot_id=? AND bundle_key=?
+            """, (robot_id, bundle_key)).fetchone()
+            if prior is not None:
+                if prior["request_hash"] != request_hash:
+                    raise ValueError("bundle key reused with different content")
+                return BundleReceipt(prior["observation_event_id"],
+                                     tuple(json.loads(prior["fact_event_ids_json"])))
+            observation_id = self.record_observation(
+                robot_id=robot_id, _db=db, **observation,
+            )
+            fact_ids = tuple(self.assert_fact(
+                robot_id=robot_id, evidence_event_id=observation_id,
+                _db=db, **fact,
+            ) for fact in normalized_facts)
+            db.execute("INSERT INTO bundles VALUES (?,?,?,?,?)", (
+                robot_id, bundle_key, request_hash, observation_id, _json(fact_ids),
+            ))
+            db.commit()
+            return BundleReceipt(observation_id, fact_ids)
 
     def retract_fact(
         self, *, robot_id: str, fact_event_id: int, evidence_event_id: int,

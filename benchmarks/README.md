@@ -27,7 +27,8 @@ and graph lookup from matched observations. This is lexical retrieval, not
 semantic understanding or answer generation.
 
 `mujoco_ant_replay` runs Gymnasium's articulated `Ant-v5` with a fixed seed.
-It records 21 pose samples over 200 simulator steps, retrieves every pose and
+It atomically records 21 evidence-linked pose samples over 200 simulator steps
+in a named simulator clock domain, retrieves every pose and
 its observation, checks a prior knowledge cursor, and restarts the memory
 runtime. It measures off-loop memory query latency, not controller timing or
 robot task performance.
@@ -45,6 +46,12 @@ was run *after* replay import, before queries.
 | Warehouse, 2,508 observations, optimized | 9/9 | 6.0 ms | 13.0 ms |
 | Warehouse, 5,008 observations, optimized | 9/9 | 9.8 ms | 25.1 ms |
 | MuJoCo Ant, 200 steps, 21 samples | 21/21; cursor and restart pass | 1.4 ms | 2.0 ms |
+
+After the atomic-bundle and clock-domain change, the 250-distractor warehouse
+replay again passed 9/9 cases, and the 200-step Ant replay passed 21/21 pose
+checks, prior-cursor lookup, and restart recovery. The full test suite passed
+25 tests with the simulator installed. These are correctness checks; the
+timings above vary by run and do not establish controller latency.
 
 Run `MemoryStore.optimize_search()` only after bulk import or in a stopped
 robot's maintenance window. It acquires a database write lock. Normal onboard

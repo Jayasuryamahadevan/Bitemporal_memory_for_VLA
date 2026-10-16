@@ -12,6 +12,13 @@ Evidence-backed directed scene relations and bounded retrieval now assemble
 facts, episodes, graph neighbors, and provenance for question answering,
 planning, and VLA context.
 
+Perception workers can submit an observation and its derived facts as one
+idempotent transaction. Each database binds a UTC or unique simulator run
+clock domain, and older databases migrate conservatively. The current
+validation includes deterministic replay and a MuJoCo Ant virtual robot;
+ROS 2, physical hardware, and learned visual question answering remain
+separate integration work.
+
 Start with the [onboard memory guide](06_memory/README.md) and
 [architecture plan](06_memory/PLAN.md).
 Install the core package, then run the demonstration and tests from the
