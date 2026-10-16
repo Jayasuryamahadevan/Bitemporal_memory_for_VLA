@@ -173,5 +173,11 @@ event schema before it combines data across clock resets or replay domains.
 7. **Evaluation gate:** compare memory enabled, disabled, and conflicting/donor
    memory using the same task seed and current observation.
 
+The [replay benchmarks](../benchmarks/README.md) now cover lexical
+question-to-entity retrieval, two-hop graph recall, corrections, abstention,
+robot isolation, and a MuJoCo Ant trajectory. OpenEQA annotation coverage was
+audited; full OpenEQA visual-answer accuracy remains unmeasured because the
+episode histories and grounded answering model were unavailable.
+
 No throughput or task-success claim is made until those robot-side measurements
 exist.

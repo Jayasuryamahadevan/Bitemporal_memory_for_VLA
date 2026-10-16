@@ -154,6 +154,21 @@ class MemoryStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timezone-aware"):
             self.observation(datetime(2026, 10, 16, 10, 0))
 
+    def test_fts_any_match_and_offline_optimization_keep_results(self):
+        red = self.observation(text="red cup on table")
+        blue = self.observation(T0 + timedelta(seconds=1), text="blue bowl on shelf")
+        self.assertEqual(self.memory.search_observations(
+            robot_id="r1", text="red bowl"), [])
+        before = {item.event_id for item in self.memory.search_observations(
+            robot_id="r1", text="red bowl", match_mode="any")}
+        self.assertEqual(before, {red, blue})
+        self.memory.optimize_search()
+        after = {item.event_id for item in self.memory.search_observations(
+            robot_id="r1", text="red bowl", match_mode="any")}
+        self.assertEqual(after, before)
+        with self.assertRaisesRegex(ValueError, "match_mode"):
+            self.memory.search_observations(robot_id="r1", match_mode="unsafe")
+
     def test_concurrent_writers_have_unique_cursors(self):
         def write(i):
             return self.memory.record_observation(

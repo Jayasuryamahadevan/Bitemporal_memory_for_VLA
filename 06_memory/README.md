@@ -179,6 +179,13 @@ not answer arbitrary natural-language questions by itself. A natural-language
 front end should translate to bounded structured filters and cite the returned
 evidence. Robot code does not receive unrestricted SQL access.
 
+Question-style text retrieval removes common question words and tries exact
+content terms first. If that finds nothing, it tries any content term. It
+uses matched observation entity IDs to retrieve facts and graph neighbors at
+the same knowledge cursor. This is a lexical candidate-retrieval step; it
+does not infer synonyms or verify a natural-language answer. The
+[benchmark report](../benchmarks/README.md) measures its behavior and limits.
+
 The hot snapshot answers current state only. It is bounded by max_hot_keys;
 eviction returns missing so callers fall back safely. It keeps at most
 max_hot_keys × history_per_key facts (capped at 4096) and may return missing for
@@ -219,6 +226,13 @@ and video should go to rosbag2/MCAP or a bounded local media store; the ledger
 keeps their durable evidence URIs. Position values must already be transformed
 into the named frame at the source timestamp. An upstream tracker owns stable
 entity IDs and uncertainty.
+
+After a bulk import, `MemoryStore.optimize_search()` can compact the text
+index in a stopped robot's maintenance window. It acquires a write lock and
+must not run inside a control callback or alongside the live writer. The
+benchmark measured a substantial query-time difference after this offline
+step; continuous robot workload and maintenance cadence still need target
+measurements.
 
 One OnboardMemory instance must own writes for a robot while it is running.
 Writes made directly through another MemoryStore or runtime do not notify the

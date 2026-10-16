@@ -649,10 +649,12 @@ class MemoryStore:
         entity_id: str | None = None, episode_id: str | None = None,
         near: tuple[float, float, float] | None = None,
         radius: float | None = None, frame_id: str | None = None,
-        limit: int = 20,
+        limit: int = 20, match_mode: str = "all",
     ) -> list[Observation]:
         robot_id = _nonempty(robot_id, "robot_id")
         _positive_limit(limit)
+        if match_mode not in ("all", "any"):
+            raise ValueError("match_mode must be 'all' or 'any'")
         if (near is None) != (radius is None):
             raise ValueError("near and radius must be supplied together")
         if near is not None:
@@ -690,9 +692,12 @@ class MemoryStore:
                                near[0], near[0], near[1], near[1], near[2], near[2], radius*radius))
             if tokens:
                 conditions.append("observation_fts MATCH ?")
-                params.append(" AND ".join('"' + token + '"' for token in tokens))
+                operator = " AND " if match_mode == "all" else " OR "
+                params.append(operator.join('"' + token + '"' for token in tokens))
                 join = "JOIN observation_fts ON observation_fts.rowid=e.id"
-                order = "bm25(observation_fts), e.observed_at_us DESC, e.id DESC"
+                # FTS5 can use its optimized rank path with LIMIT. It maps to
+                # BM25 by default and avoids explicit bm25() sorting work.
+                order = "observation_fts.rank, e.observed_at_us DESC, e.id DESC"
             else:
                 join = ""
                 order = "e.observed_at_us DESC, e.id DESC"
@@ -700,6 +705,17 @@ class MemoryStore:
                    " AND ".join(conditions) + " ORDER BY " + order + " LIMIT ?")
             rows = db.execute(sql, (*params, limit)).fetchall()
         return [self._observation(row) for row in rows]
+
+    def optimize_search(self) -> None:
+        """Compact the FTS index after bulk import, with the runtime stopped.
+
+        This can take a write lock and should run only in an offline/idle
+        maintenance window, never from an onboard query or control callback.
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT INTO observation_fts(observation_fts) VALUES ('optimize')")
+            db.commit()
 
     def get_observation(self, *, robot_id: str, event_id: int) -> Observation | None:
         with self._connect() as db:

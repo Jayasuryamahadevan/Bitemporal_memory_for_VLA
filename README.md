@@ -25,6 +25,10 @@ python -m unittest discover -s tests -v
 
 The optional MuJoCo Ant virtual-robot integration test and install steps are
 also documented in the [onboard memory guide](06_memory/README.md).
+The [benchmark report](benchmarks/README.md) covers a deterministic temporal
+warehouse replay, a MuJoCo Ant pose replay, and an audit of the official
+OpenEQA question annotations. It distinguishes those results from full
+OpenEQA answer accuracy.
 
 The [research survey](research.md) motivates the separation of the fast
 control loops from the off-loop queryable record. The existing arm lessons are

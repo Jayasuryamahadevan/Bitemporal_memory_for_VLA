@@ -108,6 +108,31 @@ class RetrievalTest(unittest.TestCase):
                 self.assertEqual(result.known_event_id,
                                  runtime.snapshot.known_event_id)
 
+    def test_question_text_discovers_entity_and_preserves_exact_matches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = MemoryStore(Path(temp) / "memory.db")
+            retriever = MemoryRetriever(store, robot_id="r1")
+            cup = store.record_observation(
+                robot_id="r1", observed_at=T0, kind="rgbd",
+                text="red cup beside sink", source="camera", entity_id="cup",
+            )
+            store.record_observation(
+                robot_id="r1", observed_at=T0, kind="rgbd",
+                text="blue cup on floor", source="camera", entity_id="blue-cup",
+            )
+            retriever.assert_relation(
+                source_entity_id="cup", relation="beside", target_entity_id="sink",
+                valid_from=T0, evidence_event_id=cup,
+                status="verified", confidence=1,
+            )
+            result = retriever.retrieve(
+                valid_at=T0, text="Where is the red cup?", graph_hops=1,
+            )
+            self.assertEqual([obs.event_id for obs in result.observations], [cup])
+            self.assertEqual(result.relations[0].target, "sink")
+            self.assertFalse(store.search_observations(
+                robot_id="r1", text="Where is the red cup?"))
+
 
 if __name__ == "__main__":
     unittest.main()

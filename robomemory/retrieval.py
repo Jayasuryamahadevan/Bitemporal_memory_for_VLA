@@ -18,6 +18,20 @@ from .store import Fact, MemoryStore, Observation, StateAnswer
 
 RELATION_PREFIX = "relation:"
 _RELATION_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
+_QUESTION_STOPWORDS = frozenset({
+    "a", "an", "the", "what", "which", "where", "when", "who", "whose",
+    "how", "many", "much", "is", "are", "was", "were", "did", "does",
+    "do", "i", "we", "you", "there", "this", "that", "these", "those",
+    "have", "has", "had", "can", "could", "would", "should", "please",
+    "now", "currently",
+})
+
+
+def _search_terms(question: str) -> str:
+    """Discard common question words before FTS; preserve relation words."""
+    tokens = re.findall(r"\w+", question.lower(), re.UNICODE)
+    meaningful = [term for term in tokens if term not in _QUESTION_STOPWORDS]
+    return " ".join(meaningful or tokens)
 
 
 def relation_predicate(relation: str, target_entity_id: str) -> str:
@@ -160,11 +174,43 @@ class MemoryRetriever:
             raise ValueError("predicates must contain at most 16 nonempty names")
         cursor = self.store.knowledge_cursor(known_at=known_at,
                                              known_event_id=known_event_id)
+        found: dict[int, Observation] = {}
+        search_limit = max_observations + 1
+        if text is not None:
+            terms = _search_terms(text)
+            if not terms:
+                raise ValueError("text must contain a searchable word")
+            for mode in ("all", "any"):
+                if mode == "any" and found:
+                    break
+                if len(found) >= search_limit:
+                    break
+                for obs in self.store.search_observations(
+                    robot_id=self.robot_id, text=terms, match_mode=mode,
+                    known_event_id=cursor,
+                    observed_until=valid_at + timedelta(microseconds=1),
+                    limit=search_limit,
+                ):
+                    found.setdefault(obs.event_id, obs)
+        if entity_id is not None:
+            for obs in self.store.search_observations(
+                robot_id=self.robot_id, entity_id=entity_id,
+                known_event_id=cursor,
+                observed_until=valid_at + timedelta(microseconds=1),
+                limit=search_limit,
+            ):
+                found.setdefault(obs.event_id, obs)
+        truncated = len(found) > max_observations
+        observations = tuple(list(found.values())[:max_observations])
+
+        # Text retrieval can discover entities. The graph and state query then
+        # use those IDs under the same pinned knowledge horizon.
         frontier = [entity_id] if entity_id else []
+        frontier.extend(obs.entity_id for obs in observations
+                        if obs.entity_id is not None and obs.entity_id not in frontier)
         visited: set[str] = set()
         states: list[tuple[str, str, StateAnswer]] = []
         relations: list[RelationHit] = []
-        truncated = False
         for depth in range(graph_hops + 1):
             next_frontier: list[str] = []
             for entity in frontier:
@@ -210,21 +256,6 @@ class MemoryRetriever:
             frontier = next_frontier
             if not frontier:
                 break
-        found: dict[int, Observation] = {}
-        for terms, subject in ((text, None), (None, entity_id)):
-            if terms is None and subject is None:
-                continue
-            for obs in self.store.search_observations(
-                robot_id=self.robot_id, text=terms, entity_id=subject,
-                known_event_id=cursor, observed_until=valid_at + timedelta(microseconds=1),
-                limit=max_observations + 1,
-            ):
-                found[obs.event_id] = obs
-            if len(found) > max_observations:
-                truncated = True
-        observations = tuple(sorted(found.values(),
-                                    key=lambda obs: (obs.observed_at, obs.event_id),
-                                    reverse=True)[:max_observations])
         evidence_ids = {state.fact.evidence_event_id for _, _, state in states
                         if state.fact is not None}
         evidence_ids.update(hit.state.fact.evidence_event_id for hit in relations)
